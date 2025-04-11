@@ -1,0 +1,98 @@
+# Binaries and build output
+bin/
+obj/
+out/
+
+# Visual Studio files
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+*.pidb
+*.dbmdl
+*.jfm
+*.pfx
+*.publishsettings
+PublishProfiles/
+_ReSharper*/
+*.resharper
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+build/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+
+# MSTest test Results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+
+# NuGet
+packages/
+*.nupkg
+# Исключаем файлы конфигурации NuGet, кроме project.json
+# !packages/repositories.config
+# !project.json
+
+# Logs
+*.log
+logs/
+
+# IDE files
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Whisper модели (скачиваются автоматически)
+models/*.bin
+models/*.ggml
+
+# User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Backup and temporary files
+*~
+*.bak
+*.tmp
+*.swp
+
+# Visual Studio Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Rider
+.idea/
+*.sln.iml
+
+# User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Audio sample files (могут быть большими)
+audioExamples/*.wav
+audioExamples/*.mp3
+audioExamples/*.flac
+# Сохраняем тестовый файл для демонстрации
+!audioExamples/test.wav 
