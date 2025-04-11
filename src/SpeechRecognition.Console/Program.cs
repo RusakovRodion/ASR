@@ -62,23 +62,33 @@ namespace SpeechRecognition.Console
                 new[] { "--model", "-m" },
                 () => new FileInfo(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "..", "models", "ggml-tiny.bin")),
                 "Путь к файлу модели Whisper");
+            
+            // Опция для количества фрагментов
+            var numChunksOption = new Option<int>(
+                new[] { "--num-chunks", "-n" },
+                () => 1,
+                "Количество фрагментов для обработки");
 
             // Создание корневой команды
             var rootCommand = new RootCommand("Консольное приложение для распознавания речи");
+            rootCommand.Name = "whisper-stream";
+            rootCommand.Description = "Программа для распознавания речи из аудиофайлов";
+            
             rootCommand.AddOption(fileOption);
             rootCommand.AddOption(languageOption);
             rootCommand.AddOption(modelOption);
+            rootCommand.AddOption(numChunksOption);
 
-            rootCommand.SetHandler(async (FileInfo file, string language, FileInfo model) =>
+            rootCommand.SetHandler(async (FileInfo file, string language, FileInfo model, int numChunks) =>
             {
-                await ProcessFile(file.FullName, language, model.FullName, logger);
-            }, fileOption, languageOption, modelOption);
+                await ProcessFile(file.FullName, language, model.FullName, numChunks, logger);
+            }, fileOption, languageOption, modelOption, numChunksOption);
 
             // Выполнение команды
             return await rootCommand.InvokeAsync(args);
         }
 
-        private static async Task ProcessFile(string filePath, string language, string modelPath, ILogger logger, CancellationToken cancellationToken = default)
+        private static async Task ProcessFile(string filePath, string language, string modelPath, int numChunks, ILogger logger, CancellationToken cancellationToken = default)
         {
             if (!File.Exists(filePath))
             {
@@ -89,6 +99,7 @@ namespace SpeechRecognition.Console
             logger.LogInformation($"Начало распознавания файла: {filePath}");
             logger.LogInformation($"Модель: {modelPath}");
             logger.LogInformation($"Язык: {language}");
+            logger.LogInformation($"Количество фрагментов: {numChunks}");
 
             try
             {
@@ -100,8 +111,8 @@ namespace SpeechRecognition.Console
                 // Инициализация процессора (при необходимости скачает модель)
                 await processor.InitializeAsync();
 
-                // Обработка файла
-                var result = await processor.ProcessFileAsync(filePath, cancellationToken);
+                // Обработка файла с разбиением на фрагменты
+                var result = await processor.ProcessFileInChunksAsync(filePath, numChunks, cancellationToken);
 
                 logger.LogInformation("Результат распознавания:");
                 System.Console.WriteLine(result);

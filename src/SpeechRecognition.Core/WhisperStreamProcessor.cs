@@ -7,6 +7,8 @@ using SpeechRecognition.Core.Audio;
 using SpeechRecognition.Core.Models;
 using SpeechRecognition.Core.Recognition;
 using SpeechRecognition.Core.Sessions;
+using System.Collections.Generic;
+using System.Text;
 
 namespace SpeechRecognition.Core
 {
@@ -157,6 +159,128 @@ namespace SpeechRecognition.Core
                 _logger.LogError(ex, $"Ошибка при обработке файла: {filePath}");
                 throw;
             }
+        }
+
+        /// <summary>
+        /// Обрабатывает аудиофайл с разбиением на указанное количество фрагментов
+        /// </summary>
+        /// <param name="filePath">Путь к аудиофайлу</param>
+        /// <param name="numChunks">Количество фрагментов</param>
+        /// <param name="cancellationToken">Токен отмены операции</param>
+        /// <returns>Результат распознавания речи</returns>
+        public async Task<string> ProcessFileInChunksAsync(string filePath, int numChunks, CancellationToken cancellationToken = default)
+        {
+            ThrowIfDisposed();
+
+            if (string.IsNullOrEmpty(filePath))
+            {
+                throw new ArgumentException("Путь к файлу не может быть пустым", nameof(filePath));
+            }
+
+            if (!File.Exists(filePath))
+            {
+                throw new FileNotFoundException("Аудиофайл не найден", filePath);
+            }
+
+            if (numChunks <= 0)
+            {
+                throw new ArgumentException("Количество фрагментов должно быть положительным числом", nameof(numChunks));
+            }
+
+            // Если указан 1 фрагмент, обрабатываем файл целиком
+            if (numChunks == 1)
+            {
+                return await ProcessFileAsync(filePath, cancellationToken);
+            }
+
+            try
+            {
+                _logger.LogInformation($"Обработка файла {filePath} с разбиением на {numChunks} фрагментов");
+                
+                // Чтение всего файла
+                byte[] fileData = await File.ReadAllBytesAsync(filePath, cancellationToken);
+                
+                // Проверяем, что это WAV файл
+                if (!_audioProcessor.IsWavFile(fileData))
+                {
+                    throw new InvalidOperationException("Файл должен быть в формате WAV");
+                }
+                
+                // Извлекаем PCM данные из WAV файла
+                byte[] pcmData = _audioProcessor.ExtractPcmFromWav(fileData);
+                
+                // Разбиваем на фрагменты
+                List<byte[]> chunks = SplitIntoChunks(pcmData, numChunks);
+                
+                // Создаем новую сессию для обработки фрагментов
+                Guid sessionId = CreateNewSession();
+                
+                StringBuilder resultBuilder = new StringBuilder();
+                
+                // Обрабатываем каждый фрагмент
+                for (int i = 0; i < chunks.Count; i++)
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        throw new OperationCanceledException("Операция отменена пользователем");
+                    }
+                    
+                    _logger.LogInformation($"Обработка фрагмента {i + 1} из {chunks.Count}");
+                    
+                    // Добавляем WAV-заголовок к PCM данным
+                    byte[] wavChunk = _audioProcessor.AddWavHeader(chunks[i]);
+                    
+                    // Обрабатываем фрагмент
+                    var result = await _sessionManager.ProcessFragmentAsync(sessionId, wavChunk, cancellationToken);
+                    
+                    if (result != null && !string.IsNullOrEmpty(result.Text))
+                    {
+                        if (resultBuilder.Length > 0)
+                        {
+                            resultBuilder.Append(' ');
+                        }
+                        resultBuilder.Append(result.Text);
+                    }
+                }
+                
+                return resultBuilder.ToString();
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("Операция распознавания файла была отменена");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Ошибка при обработке файла: {filePath}");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Разбивает данные на указанное количество фрагментов
+        /// </summary>
+        private List<byte[]> SplitIntoChunks(byte[] data, int numChunks)
+        {
+            List<byte[]> chunks = new List<byte[]>();
+            
+            int chunkSize = data.Length / numChunks;
+            
+            // Делаем размер фрагмента кратным 4 для обеспечения правильной обработки 16-битных стерео данных
+            chunkSize = (chunkSize / 4) * 4;
+            
+            for (int i = 0; i < numChunks; i++)
+            {
+                int startIndex = i * chunkSize;
+                int length = (i < numChunks - 1) ? chunkSize : (data.Length - startIndex);
+                
+                byte[] chunk = new byte[length];
+                Array.Copy(data, startIndex, chunk, 0, length);
+                
+                chunks.Add(chunk);
+            }
+            
+            return chunks;
         }
 
         /// <summary>

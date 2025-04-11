@@ -39,5 +39,19 @@ namespace SpeechRecognition.Core.Audio
         /// <param name="channels">Количество каналов (по умолчанию 1 - моно)</param>
         /// <returns>Данные с WAV-заголовком</returns>
         byte[] AddWavHeader(byte[] pcmData, int sampleRate = 16000, int bitsPerSample = 16, int channels = 1);
+
+        /// <summary>
+        /// Проверяет, является ли массив байтов WAV-файлом
+        /// </summary>
+        /// <param name="data">Проверяемые данные</param>
+        /// <returns>true, если данные имеют заголовок WAV-файла</returns>
+        bool IsWavFile(byte[] data);
+
+        /// <summary>
+        /// Извлекает PCM-данные из WAV-файла
+        /// </summary>
+        /// <param name="wavData">WAV-данные с заголовком</param>
+        /// <returns>PCM-данные без заголовка</returns>
+        byte[] ExtractPcmFromWav(byte[] wavData);
     }
 } 

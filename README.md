@@ -22,8 +22,8 @@
 
 ## Требования
 
-- .NET 7.0 или выше
-- Модель Whisper (ggml-base.bin или аналогичная)
+- .NET 9.0 или выше
+- Модель Whisper (ggml-tiny.bin или аналогичная)
 
 ## Установка
 
@@ -50,14 +50,24 @@ mkdir models
 ### Консольное приложение
 
 ```bash
-cd src/SpeechRecognition.Console/bin/Debug/net7.0
-dotnet SpeechRecognition.Console.dll --file path/to/audio.wav --language ru --model path/to/model.bin
+# Использование опубликованной версии
+cd publish
+./whisper-stream --file path/to/audio.wav --language ru --model path/to/model.bin --num-chunks 1
+```
+
+или
+
+```bash
+# Использование версии для разработки
+cd src
+dotnet run --project SpeechRecognition.Console -- --file path/to/audio.wav --language ru --num-chunks 2
 ```
 
 Параметры:
 - `--file`, `-f` - путь к аудиофайлу для распознавания
 - `--language`, `-l` - язык для распознавания (по умолчанию: ru)
-- `--model`, `-m` - путь к файлу модели Whisper (по умолчанию: models/ggml-base.bin)
+- `--model`, `-m` - путь к файлу модели Whisper (по умолчанию: models/ggml-tiny.bin)
+- `--num-chunks`, `-n` - количество фрагментов для обработки аудиофайла (по умолчанию: 1)
 
 ### Использование как библиотеки
 
@@ -72,6 +82,11 @@ await processor.InitializeAsync();
 // Обработка файла
 string result = await processor.ProcessFileAsync("path/to/audio.wav");
 Console.WriteLine(result);
+
+// Обработка файла с разбиением на фрагменты
+int numChunks = 3; // Количество фрагментов
+string resultChunks = await processor.ProcessFileInChunksAsync("path/to/audio.wav", numChunks);
+Console.WriteLine(resultChunks);
 
 // Обработка потока аудиофрагментов
 byte[] audioChunk = GetAudioChunk(); // Получение аудиофрагмента

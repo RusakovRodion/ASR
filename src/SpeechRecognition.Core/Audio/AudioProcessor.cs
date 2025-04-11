@@ -138,6 +138,77 @@ namespace SpeechRecognition.Core.Audio
         }
 
         /// <summary>
+        /// Проверяет, является ли массив байтов WAV-файлом
+        /// </summary>
+        /// <param name="data">Проверяемые данные</param>
+        /// <returns>true, если данные имеют заголовок WAV-файла</returns>
+        public bool IsWavFile(byte[] data)
+        {
+            return IsWavFormat(data);
+        }
+        
+        /// <summary>
+        /// Извлекает PCM-данные из WAV-файла
+        /// </summary>
+        /// <param name="wavData">WAV-данные с заголовком</param>
+        /// <returns>PCM-данные без заголовка</returns>
+        public byte[] ExtractPcmFromWav(byte[] wavData)
+        {
+            if (!IsWavFile(wavData))
+            {
+                throw new ArgumentException("Данные не являются WAV-файлом", nameof(wavData));
+            }
+            
+            using (var stream = new MemoryStream(wavData))
+            using (var reader = new WaveFileReader(stream))
+            {
+                // Находим расположение data-секции в WAV-файле
+                int dataOffset = -1;
+                int dataSize = 0;
+                
+                // Перенаправляем чтение в самое начало
+                stream.Position = 0;
+                using (var br = new BinaryReader(stream))
+                {
+                    // Пропускаем 4 байта "RIFF"
+                    br.ReadBytes(4);
+                    // Размер файла
+                    br.ReadInt32();
+                    // Пропускаем 4 байта "WAVE"
+                    br.ReadBytes(4);
+                    
+                    // Ищем секцию "data"
+                    while (stream.Position < stream.Length - 8)
+                    {
+                        string chunkId = Encoding.ASCII.GetString(br.ReadBytes(4));
+                        int chunkSize = br.ReadInt32();
+                        
+                        if (chunkId == "data")
+                        {
+                            dataOffset = (int)stream.Position;
+                            dataSize = chunkSize;
+                            break;
+                        }
+                        
+                        // Пропускаем текущую секцию
+                        stream.Position += chunkSize;
+                    }
+                }
+                
+                if (dataOffset == -1)
+                {
+                    throw new InvalidOperationException("Не найдена секция data в WAV-файле");
+                }
+                
+                // Копируем только PCM-данные
+                byte[] pcmData = new byte[dataSize];
+                Array.Copy(wavData, dataOffset, pcmData, 0, dataSize);
+                
+                return pcmData;
+            }
+        }
+
+        /// <summary>
         /// Конвертирует WAV-файл в нужный формат
         /// </summary>
         /// <param name="wavData">Исходные WAV-данные</param>
