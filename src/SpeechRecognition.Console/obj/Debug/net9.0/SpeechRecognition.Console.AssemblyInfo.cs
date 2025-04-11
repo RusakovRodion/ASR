@@ -10,12 +10,12 @@
 using System;
 using System.Reflection;
 
-[assembly: System.Reflection.AssemblyCompanyAttribute("SpeechRecognition.Console")]
+[assembly: System.Reflection.AssemblyCompanyAttribute("whisper-stream")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+19fc48b41fe2f9aed7f7ada0af43cf8e34d1ecd9")]
-[assembly: System.Reflection.AssemblyProductAttribute("SpeechRecognition.Console")]
-[assembly: System.Reflection.AssemblyTitleAttribute("SpeechRecognition.Console")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+5a8c6452d98d238a5dc416568a17698bb1a7359a")]
+[assembly: System.Reflection.AssemblyProductAttribute("whisper-stream")]
+[assembly: System.Reflection.AssemblyTitleAttribute("whisper-stream")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
 
 // Создано классом WriteCodeFragment MSBuild.

@@ -9,6 +9,7 @@ using SpeechRecognition.Core.Recognition;
 using SpeechRecognition.Core.Sessions;
 using System.Collections.Generic;
 using System.Text;
+using SpeechRecognition.Core.Events;
 
 namespace SpeechRecognition.Core
 {
@@ -24,6 +25,16 @@ namespace SpeechRecognition.Core
         private readonly ModelDownloader _modelDownloader;
         private RecognitionSession _currentSession;
         private bool _isDisposed;
+
+        /// <summary>
+        /// Событие, возникающее при получении результата распознавания речи
+        /// </summary>
+        public event EventHandler<RecognitionEventArgs> RecognitionCompleted;
+
+        /// <summary>
+        /// Событие, возникающее перед началом распознавания речи
+        /// </summary>
+        public event EventHandler<RecognitionEventArgs> RecognitionStarted;
 
         /// <summary>
         /// Создает новый экземпляр класса WhisperStreamProcessor
@@ -50,7 +61,22 @@ namespace SpeechRecognition.Core
             // Создаем сессию для обработки потока
             _currentSession = _sessionManager.CreateSession();
             
+            // Подписываемся на события SessionManager
+            _sessionManager.RecognitionStarted += OnSessionManagerRecognitionStarted;
+            _sessionManager.RecognitionCompleted += OnSessionManagerRecognitionCompleted;
+            
             _logger.LogInformation($"WhisperStreamProcessor создан с моделью: {modelPath}, язык: {language}");
+        }
+
+        // Обработчики событий SessionManager
+        private void OnSessionManagerRecognitionStarted(object sender, RecognitionEventArgs e)
+        {
+            RecognitionStarted?.Invoke(this, e);
+        }
+
+        private void OnSessionManagerRecognitionCompleted(object sender, RecognitionEventArgs e)
+        {
+            RecognitionCompleted?.Invoke(this, e);
         }
 
         /// <summary>
@@ -305,6 +331,10 @@ namespace SpeechRecognition.Core
             {
                 return;
             }
+
+            // Отписываемся от событий SessionManager
+            _sessionManager.RecognitionStarted -= OnSessionManagerRecognitionStarted;
+            _sessionManager.RecognitionCompleted -= OnSessionManagerRecognitionCompleted;
 
             _sessionManager.Dispose();
             _recognizer.Dispose();

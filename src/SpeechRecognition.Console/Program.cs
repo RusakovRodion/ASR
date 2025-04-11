@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using SpeechRecognition.Core;
+using SpeechRecognition.Core.Events;
 
 namespace SpeechRecognition.Console
 {
@@ -107,6 +108,17 @@ namespace SpeechRecognition.Console
                 string modelType = Path.GetFileNameWithoutExtension(modelPath).Contains("tiny") ? "tiny" : "base";
                 
                 using var processor = new WhisperStreamProcessor(logger, modelPath, language, modelType);
+                
+                // Подписываемся на события распознавания
+                processor.RecognitionStarted += (sender, e) => 
+                {
+                    logger.LogInformation($"Начало распознавания фрагмента #{e.Result.FragmentId}");
+                };
+                
+                processor.RecognitionCompleted += (sender, e) => 
+                {
+                    logger.LogInformation($"Распознавание фрагмента #{e.Result.FragmentId} завершено. Длительность: {(e.Result.EndTime - e.Result.StartTime).TotalMilliseconds} мс");
+                };
                 
                 // Инициализация процессора (при необходимости скачает модель)
                 await processor.InitializeAsync();

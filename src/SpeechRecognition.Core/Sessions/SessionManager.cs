@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using SpeechRecognition.Core.Recognition;
+using SpeechRecognition.Core.Events;
 
 namespace SpeechRecognition.Core.Sessions
 {
@@ -16,6 +17,16 @@ namespace SpeechRecognition.Core.Sessions
         private readonly ISpeechRecognizer _recognizer;
         private readonly ConcurrentDictionary<Guid, RecognitionSession> _sessions;
         private bool _isDisposed;
+
+        /// <summary>
+        /// Событие, возникающее при получении результата распознавания речи
+        /// </summary>
+        public event EventHandler<RecognitionEventArgs> RecognitionCompleted;
+
+        /// <summary>
+        /// Событие, возникающее перед началом распознавания речи
+        /// </summary>
+        public event EventHandler<RecognitionEventArgs> RecognitionStarted;
 
         /// <summary>
         /// Создает новый экземпляр класса SessionManager
@@ -37,8 +48,24 @@ namespace SpeechRecognition.Core.Sessions
             ThrowIfDisposed();
 
             var session = new RecognitionSession(_recognizer);
+            
+            // Подписываемся на события сессии
+            session.RecognitionStarted += OnSessionRecognitionStarted;
+            session.RecognitionCompleted += OnSessionRecognitionCompleted;
+            
             _sessions.TryAdd(session.Id, session);
             return session;
+        }
+
+        // Обработчики событий сессии
+        private void OnSessionRecognitionStarted(object sender, RecognitionEventArgs e)
+        {
+            RecognitionStarted?.Invoke(this, e);
+        }
+
+        private void OnSessionRecognitionCompleted(object sender, RecognitionEventArgs e)
+        {
+            RecognitionCompleted?.Invoke(this, e);
         }
 
         /// <summary>
@@ -65,6 +92,10 @@ namespace SpeechRecognition.Core.Sessions
 
             if (_sessions.TryRemove(sessionId, out var session))
             {
+                // Отписываемся от событий сессии
+                session.RecognitionStarted -= OnSessionRecognitionStarted;
+                session.RecognitionCompleted -= OnSessionRecognitionCompleted;
+                
                 session.Dispose();
                 return true;
             }
@@ -119,6 +150,10 @@ namespace SpeechRecognition.Core.Sessions
 
             foreach (var session in _sessions.Values)
             {
+                // Отписываемся от событий сессии
+                session.RecognitionStarted -= OnSessionRecognitionStarted;
+                session.RecognitionCompleted -= OnSessionRecognitionCompleted;
+                
                 session.Dispose();
             }
 

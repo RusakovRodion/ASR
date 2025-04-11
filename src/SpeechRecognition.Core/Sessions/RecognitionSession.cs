@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using SpeechRecognition.Core.Recognition;
+using SpeechRecognition.Core.Events;
 
 namespace SpeechRecognition.Core.Sessions
 {
@@ -15,6 +16,16 @@ namespace SpeechRecognition.Core.Sessions
         private readonly Dictionary<int, RecognitionResult> _results;
         private int _nextFragmentId;
         private bool _isDisposed;
+
+        /// <summary>
+        /// Событие, возникающее при получении результата распознавания речи
+        /// </summary>
+        public event EventHandler<RecognitionEventArgs> RecognitionCompleted;
+
+        /// <summary>
+        /// Событие, возникающее перед началом распознавания речи
+        /// </summary>
+        public event EventHandler<RecognitionEventArgs> RecognitionStarted;
 
         /// <summary>
         /// Идентификатор сессии
@@ -47,6 +58,24 @@ namespace SpeechRecognition.Core.Sessions
         }
 
         /// <summary>
+        /// Вызывает событие начала распознавания
+        /// </summary>
+        /// <param name="result">Объект с результатами распознавания</param>
+        protected virtual void OnRecognitionStarted(RecognitionResult result)
+        {
+            RecognitionStarted?.Invoke(this, new RecognitionEventArgs(result));
+        }
+
+        /// <summary>
+        /// Вызывает событие завершения распознавания
+        /// </summary>
+        /// <param name="result">Объект с результатами распознавания</param>
+        protected virtual void OnRecognitionCompleted(RecognitionResult result)
+        {
+            RecognitionCompleted?.Invoke(this, new RecognitionEventArgs(result));
+        }
+
+        /// <summary>
         /// Распознает речь из фрагмента аудиоданных
         /// </summary>
         /// <param name="audioFragment">Фрагмент аудиоданных</param>
@@ -64,6 +93,12 @@ namespace SpeechRecognition.Core.Sessions
             int fragmentId = Interlocked.Increment(ref _nextFragmentId) - 1;
             DateTime startTime = DateTime.Now;
 
+            // Создаем предварительный результат
+            var preliminaryResult = new RecognitionResult(Id, fragmentId, "", startTime, startTime);
+            
+            // Вызываем событие начала распознавания
+            OnRecognitionStarted(preliminaryResult);
+
             // Распознавание речи
             string recognizedText = await _recognizer.RecognizeSpeechAsync(audioFragment, cancellationToken);
 
@@ -77,6 +112,9 @@ namespace SpeechRecognition.Core.Sessions
             {
                 _results[fragmentId] = result;
             }
+            
+            // Вызываем событие завершения распознавания
+            OnRecognitionCompleted(result);
 
             return result;
         }
