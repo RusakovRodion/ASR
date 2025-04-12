@@ -12,6 +12,7 @@ using System.Text;
 using SpeechRecognition.Core.Events;
 using System.Text.RegularExpressions;
 using System.Linq;
+using NAudio.Wave;
 
 namespace SpeechRecognition.Core
 {
@@ -275,6 +276,14 @@ namespace SpeechRecognition.Core
                             var result = await session.ProcessFragmentAsync(wavChunks[fragmentIndex], cancellationToken);
                             DateTime endTime = DateTime.Now;
                             
+                            // Определяем примерную длительность аудиофрагмента в секундах
+                            double audioLengthSeconds = 0;
+                            using (var stream = new MemoryStream(wavChunks[fragmentIndex]))
+                            using (var reader = new WaveFileReader(stream))
+                            {
+                                audioLengthSeconds = (double)reader.Length / reader.WaveFormat.AverageBytesPerSecond;
+                            }
+                            
                             // Очищаем текст от шума
                             string cleanedText = CleanupMusic(result.Text);
                             
@@ -282,7 +291,7 @@ namespace SpeechRecognition.Core
                             string fragmentOutput = $"[{DateTime.Now:HH:mm:ss.fff}] === Фрагмент {fragmentIndex + 1} ===\n{cleanedText}\n";
                             
                             // Выводим результат сразу в консоль
-                            _logger.LogInformation($"Завершено распознавание фрагмента #{fragmentIndex + 1} в сессии {session.Id}. Длительность: {(endTime - startTime).TotalSeconds:F2} с");
+                            _logger.LogInformation($"Завершено распознавание фрагмента #{fragmentIndex + 1} в сессии {session.Id}. Длительность обработки: {(endTime - startTime).TotalSeconds:F2} с, длительность аудио: {audioLengthSeconds:F2} с");
                             Console.WriteLine(fragmentOutput);
                             
                             // Добавляем результат в общий вывод (хотя в данном случае не важно, т.к. результаты уже выведены)

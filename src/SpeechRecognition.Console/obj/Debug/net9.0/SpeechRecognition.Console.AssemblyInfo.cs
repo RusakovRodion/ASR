@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("whisper-stream")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+5a8c6452d98d238a5dc416568a17698bb1a7359a")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+cb8df6d2fb543163478d3bb2ce6213259c13a514")]
 [assembly: System.Reflection.AssemblyProductAttribute("whisper-stream")]
 [assembly: System.Reflection.AssemblyTitleAttribute("whisper-stream")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

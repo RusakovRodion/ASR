@@ -15,7 +15,7 @@ namespace SpeechRecognition.Core.Recognition
     {
         private readonly IAudioProcessor _audioProcessor;
         private WhisperFactory? _whisperFactory;
-        private WhisperProcessor? _whisperProcessor;
+        private Whisper.net.WhisperProcessor? _whisperProcessor;
         private readonly string _language;
         private bool _isInitialized;
         private bool _isDisposed;
