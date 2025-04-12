@@ -61,7 +61,7 @@ namespace SpeechRecognition.Console
             // Опция для выбора модели
             var modelOption = new Option<FileInfo>(
                 new[] { "--model", "-m" },
-                () => new FileInfo(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "..", "models", "ggml-tiny.bin")),
+                () => new FileInfo(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "..", "models", "ggml-base.bin")),
                 "Путь к файлу модели Whisper");
             
             // Опция для количества фрагментов
@@ -112,12 +112,12 @@ namespace SpeechRecognition.Console
                 // Подписываемся на события распознавания
                 processor.RecognitionStarted += (sender, e) => 
                 {
-                    logger.LogInformation($"Начало распознавания фрагмента #{e.Result.FragmentId}");
+                    logger.LogInformation($"Начало распознавания фрагмента #{e.Result.FragmentId + 1}");
                 };
                 
                 processor.RecognitionCompleted += (sender, e) => 
                 {
-                    logger.LogInformation($"Распознавание фрагмента #{e.Result.FragmentId} завершено. Длительность: {(e.Result.EndTime - e.Result.StartTime).TotalMilliseconds} мс");
+                    logger.LogInformation($"Распознавание фрагмента #{e.Result.FragmentId + 1} завершено. Длительность: {(e.Result.EndTime - e.Result.StartTime).TotalSeconds:F2} с");
                 };
                 
                 // Инициализация процессора (при необходимости скачает модель)
@@ -126,8 +126,18 @@ namespace SpeechRecognition.Console
                 // Обработка файла с разбиением на фрагменты
                 var result = await processor.ProcessFileInChunksAsync(filePath, numChunks, cancellationToken);
 
+                // Выводим информацию о результате
                 logger.LogInformation("Результат распознавания:");
                 System.Console.WriteLine(result);
+                
+                // Ждем, пока все фрагменты будут обработаны
+                if (numChunks > 1)
+                {
+                    System.Console.WriteLine();
+                    System.Console.WriteLine("Обработка фрагментов выполняется асинхронно...");
+                    System.Console.WriteLine("Нажмите Enter для завершения, когда все фрагменты будут распознаны...");
+                    System.Console.ReadLine();
+                }
             }
             catch (OperationCanceledException)
             {

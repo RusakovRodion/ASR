@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Threading.Tasks;
+using System.Collections.Generic;
 
 namespace SpeechRecognition.Core.Audio
 {
@@ -53,5 +54,13 @@ namespace SpeechRecognition.Core.Audio
         /// <param name="wavData">WAV-данные с заголовком</param>
         /// <returns>PCM-данные без заголовка</returns>
         byte[] ExtractPcmFromWav(byte[] wavData);
+
+        /// <summary>
+        /// Разбивает аудиофайл на указанное количество отдельных WAV-фрагментов
+        /// </summary>
+        /// <param name="filePath">Путь к исходному WAV-файлу</param>
+        /// <param name="numChunks">Количество фрагментов для разбиения</param>
+        /// <returns>Список байтовых массивов, содержащих независимые WAV-фрагменты</returns>
+        Task<List<byte[]>> SplitAudioFileIntoChunksAsync(string filePath, int numChunks);
     }
 } 

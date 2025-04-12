@@ -10,6 +10,8 @@ using SpeechRecognition.Core.Sessions;
 using System.Collections.Generic;
 using System.Text;
 using SpeechRecognition.Core.Events;
+using System.Text.RegularExpressions;
+using System.Linq;
 
 namespace SpeechRecognition.Core
 {
@@ -25,6 +27,8 @@ namespace SpeechRecognition.Core
         private readonly ModelDownloader _modelDownloader;
         private RecognitionSession _currentSession;
         private bool _isDisposed;
+        private readonly string _language;
+        private int numChunksUsed = 1;
 
         /// <summary>
         /// Событие, возникающее при получении результата распознавания речи
@@ -57,6 +61,7 @@ namespace SpeechRecognition.Core
             _recognizer = new WhisperRecognizer(_audioProcessor, modelPath, language);
             _sessionManager = new SessionManager(_recognizer);
             _isDisposed = false;
+            _language = language;
 
             // Создаем сессию для обработки потока
             _currentSession = _sessionManager.CreateSession();
@@ -213,63 +218,98 @@ namespace SpeechRecognition.Core
                 throw new ArgumentException("Количество фрагментов должно быть положительным числом", nameof(numChunks));
             }
 
-            // Если указан 1 фрагмент, обрабатываем файл целиком
-            if (numChunks == 1)
-            {
-                return await ProcessFileAsync(filePath, cancellationToken);
-            }
-
             try
             {
                 _logger.LogInformation($"Обработка файла {filePath} с разбиением на {numChunks} фрагментов");
                 
-                // Чтение всего файла
-                byte[] fileData = await File.ReadAllBytesAsync(filePath, cancellationToken);
-                
                 // Проверяем, что это WAV файл
+                byte[] fileData = await File.ReadAllBytesAsync(filePath, cancellationToken);
                 if (!_audioProcessor.IsWavFile(fileData))
                 {
                     throw new InvalidOperationException("Файл должен быть в формате WAV");
                 }
                 
-                // Извлекаем PCM данные из WAV файла
-                byte[] pcmData = _audioProcessor.ExtractPcmFromWav(fileData);
+                // Устанавливаем количество используемых чанков
+                numChunksUsed = numChunks;
                 
-                // Разбиваем на фрагменты
-                List<byte[]> chunks = SplitIntoChunks(pcmData, numChunks);
+                // Используем метод из AudioProcessor для разбиения на фрагменты
+                List<byte[]> wavChunks = await _audioProcessor.SplitAudioFileIntoChunksAsync(filePath, numChunks);
                 
-                // Создаем новую сессию для обработки фрагментов
-                Guid sessionId = CreateNewSession();
+                _logger.LogInformation($"Файл разбит на {wavChunks.Count} фрагментов");
                 
-                StringBuilder resultBuilder = new StringBuilder();
-                
-                // Обрабатываем каждый фрагмент
-                for (int i = 0; i < chunks.Count; i++)
+                if (wavChunks.Count <= 1)
                 {
-                    if (cancellationToken.IsCancellationRequested)
-                    {
-                        throw new OperationCanceledException("Операция отменена пользователем");
-                    }
-                    
-                    _logger.LogInformation($"Обработка фрагмента {i + 1} из {chunks.Count}");
-                    
-                    // Добавляем WAV-заголовок к PCM данным
-                    byte[] wavChunk = _audioProcessor.AddWavHeader(chunks[i]);
-                    
-                    // Обрабатываем фрагмент
-                    var result = await _sessionManager.ProcessFragmentAsync(sessionId, wavChunk, cancellationToken);
-                    
-                    if (result != null && !string.IsNullOrEmpty(result.Text))
-                    {
-                        if (resultBuilder.Length > 0)
-                        {
-                            resultBuilder.Append(' ');
-                        }
-                        resultBuilder.Append(result.Text);
-                    }
+                    _logger.LogInformation("Аудиофайл не был разбит на фрагменты (возможно, он слишком короткий), обрабатываем целиком");
+                    return await ProcessFileAsync(filePath, cancellationToken);
                 }
                 
-                return resultBuilder.ToString();
+                _logger.LogInformation($"Запуск обработки {wavChunks.Count} фрагментов в отдельных полностью независимых сессиях");
+                
+                // Создаем реальный вывод для консоли, а не просто логов
+                var finalResult = new StringBuilder();
+                Console.WriteLine("Результаты распознавания будут выводиться по мере их получения:");
+                Console.WriteLine();
+                
+                // Запускаем обработку каждого фрагмента в отдельной сессии и не ждем их завершения
+                for (int i = 0; i < wavChunks.Count; i++)
+                {
+                    int fragmentIndex = i; // Копируем индекс для использования в лямбде
+                    
+                    // Запускаем обработку фрагмента в отдельной задаче
+                    _ = Task.Run(async () => 
+                    {
+                        try
+                        {
+                            // Создаем новый распознаватель для этой сессии
+                            var recognizer = new WhisperRecognizer(_audioProcessor, ((WhisperRecognizer)_recognizer).ModelPath, _language);
+                            await recognizer.InitializeAsync();
+                            
+                            // Создаем новую сессию
+                            using var session = new RecognitionSession(recognizer);
+                            
+                            _logger.LogInformation($"Начало распознавания фрагмента #{fragmentIndex + 1} в сессии {session.Id}");
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Начало распознавания фрагмента #{fragmentIndex + 1}");
+                            
+                            // Распознаем речь
+                            DateTime startTime = DateTime.Now;
+                            var result = await session.ProcessFragmentAsync(wavChunks[fragmentIndex], cancellationToken);
+                            DateTime endTime = DateTime.Now;
+                            
+                            // Очищаем текст от шума
+                            string cleanedText = CleanupMusic(result.Text);
+                            
+                            // Форматируем результат с текущим временем
+                            string fragmentOutput = $"[{DateTime.Now:HH:mm:ss.fff}] === Фрагмент {fragmentIndex + 1} ===\n{cleanedText}\n";
+                            
+                            // Выводим результат сразу в консоль
+                            _logger.LogInformation($"Завершено распознавание фрагмента #{fragmentIndex + 1} в сессии {session.Id}. Длительность: {(endTime - startTime).TotalSeconds:F2} с");
+                            Console.WriteLine(fragmentOutput);
+                            
+                            // Добавляем результат в общий вывод (хотя в данном случае не важно, т.к. результаты уже выведены)
+                            lock (finalResult)
+                            {
+                                finalResult.AppendLine(fragmentOutput);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            string errorMessage = $"[{DateTime.Now:HH:mm:ss.fff}] === Фрагмент {fragmentIndex + 1} ===\nОшибка: {ex.Message}\n";
+                            _logger.LogError(ex, $"Ошибка при обработке фрагмента #{fragmentIndex + 1}");
+                            
+                            // Вывод ошибки в консоль
+                            Console.WriteLine(errorMessage);
+                            
+                            // Добавляем сообщение об ошибке в общий вывод
+                            lock (finalResult)
+                            {
+                                finalResult.AppendLine(errorMessage);
+                            }
+                        }
+                    }, cancellationToken);
+                }
+                
+                // Возвращаем сообщение о том, что результаты выводятся по мере их получения
+                return "Результаты распознавания выводятся по мере их получения.";
             }
             catch (OperationCanceledException)
             {
@@ -284,42 +324,196 @@ namespace SpeechRecognition.Core
         }
 
         /// <summary>
-        /// Разбивает данные на указанное количество фрагментов
+        /// Очищает повторяющиеся метки [музыка] и другие заполнители в тексте
         /// </summary>
-        private List<byte[]> SplitIntoChunks(byte[] data, int numChunks)
+        private string CleanupMusic(string text)
         {
-            List<byte[]> chunks = new List<byte[]>();
-            
-            int chunkSize = data.Length / numChunks;
-            
-            // Делаем размер фрагмента кратным 4 для обеспечения правильной обработки 16-битных стерео данных
-            chunkSize = (chunkSize / 4) * 4;
-            
-            for (int i = 0; i < numChunks; i++)
+            if (string.IsNullOrEmpty(text))
             {
-                int startIndex = i * chunkSize;
-                int length = (i < numChunks - 1) ? chunkSize : (data.Length - startIndex);
-                
-                byte[] chunk = new byte[length];
-                Array.Copy(data, startIndex, chunk, 0, length);
-                
-                chunks.Add(chunk);
+                return string.Empty;
             }
             
-            return chunks;
+            // Создаем список известных меток музыки
+            var musicPatterns = new List<string> 
+            { 
+                @"\[музыка\]", 
+                @"\[весёлая музыка\]",
+                @"\[фоновая музыка\]",
+                @"\[тихая музыка\]",
+                @"\[громкая музыка\]",
+                @"\[классическая музыка\]",
+                @"\[музыкальная заставка\]",
+                @"\[музыкальная пауза\]"
+            };
+            
+            string cleaned = text;
+            
+            // Заменяем последовательности одинаковых меток на одну
+            foreach (var musicPattern in musicPatterns)
+            {
+                string repeatedPattern = $"({musicPattern}\\s*){{2,}}";
+                cleaned = Regex.Replace(cleaned, repeatedPattern, m => musicPattern.Replace("\\", "") + " ");
+            }
+            
+            // Общий шаблон для любой музыкальной метки
+            string generalMusicPattern = @"(\[(?:\w+\s+)?музыка(?:\s+\w+)?\]\s*){2,}";
+            cleaned = Regex.Replace(cleaned, generalMusicPattern, m => m.Groups[1].Value);
+            
+            // Удаляем технические метки
+            cleaned = Regex.Replace(cleaned, @"\[NHSU\]|\bNHSU\b", "");
+            cleaned = Regex.Replace(cleaned, @"\[HUD\]|\bHUD\b", "");
+            cleaned = Regex.Replace(cleaned, @"\[неразборчиво\]", "");
+            cleaned = Regex.Replace(cleaned, @"\[шум\]|\[фоновый шум\]", "");
+            
+            // Удаляем информацию о редакторе и корректоре, которая часто появляется в конце
+            cleaned = Regex.Replace(cleaned, @"редактор субтитров\s*\.[\w\s\.]+", "", RegexOptions.IgnoreCase);
+            cleaned = Regex.Replace(cleaned, @"корректор\s*\.[\w\s\.]+", "", RegexOptions.IgnoreCase);
+            
+            // Удаляем короткие непонятные последовательности символов
+            cleaned = Regex.Replace(cleaned, @"\b\w{1,2}\b", "");
+            
+            // Удаляем случайные англоязычные вставки, если язык распознавания - русский
+            if (_language == "ru")
+            {
+                cleaned = Regex.Replace(cleaned, @"\b[a-zA-Z]{1,4}\b", "");
+            }
+            
+            // Очищаем лишние пробелы
+            cleaned = Regex.Replace(cleaned, @"\s+", " ");
+            
+            // Максимум одна метка музыки в начале и в конце
+            if (musicPatterns.Any(p => Regex.IsMatch(cleaned, p.Replace("\\", ""))))
+            {
+                // Удаляем лишние метки музыки в середине текста, оставляя только в начале и конце
+                var words = cleaned.Split(' ');
+                bool hasStartMusicTag = false;
+                bool hasEndMusicTag = false;
+                
+                // Проверяем, есть ли метка в начале
+                foreach (var musicPattern in musicPatterns)
+                {
+                    string plainPattern = musicPattern.Replace("\\", "");
+                    if (words.Length > 0 && words[0] == plainPattern)
+                    {
+                        hasStartMusicTag = true;
+                        break;
+                    }
+                }
+                
+                // Проверяем, есть ли метка в конце
+                foreach (var musicPattern in musicPatterns)
+                {
+                    string plainPattern = musicPattern.Replace("\\", "");
+                    if (words.Length > 0 && words[words.Length - 1] == plainPattern)
+                    {
+                        hasEndMusicTag = true;
+                        break;
+                    }
+                }
+                
+                // Фильтруем промежуточные метки музыки
+                List<string> filteredWords = new List<string>();
+                if (hasStartMusicTag)
+                {
+                    filteredWords.Add(words[0]);
+                }
+                
+                for (int i = hasStartMusicTag ? 1 : 0; i < (hasEndMusicTag ? words.Length - 1 : words.Length); i++)
+                {
+                    bool isMusicTag = false;
+                    foreach (var musicPattern in musicPatterns)
+                    {
+                        string plainPattern = musicPattern.Replace("\\", "");
+                        if (words[i] == plainPattern)
+                        {
+                            isMusicTag = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!isMusicTag)
+                    {
+                        filteredWords.Add(words[i]);
+                    }
+                }
+                
+                if (hasEndMusicTag)
+                {
+                    filteredWords.Add(words[words.Length - 1]);
+                }
+                
+                cleaned = string.Join(" ", filteredWords);
+            }
+            
+            return cleaned.Trim();
         }
 
         /// <summary>
-        /// Создает новую сессию распознавания
+        /// Объединение результатов распознавания
         /// </summary>
-        /// <returns>Идентификатор созданной сессии</returns>
-        public Guid CreateNewSession()
+        /// <param name="recognizedTexts">Список распознанных текстов по фрагментам</param>
+        /// <returns>Объединенный текст</returns>
+        private string MergeRecognitionResults(List<string> recognizedTexts)
         {
-            ThrowIfDisposed();
-
-            _currentSession = _sessionManager.CreateSession();
-            _logger.LogInformation($"Создана новая сессия с ID: {_currentSession.Id}");
-            return _currentSession.Id;
+            if (recognizedTexts == null || recognizedTexts.Count == 0)
+            {
+                return string.Empty;
+            }
+            
+            if (recognizedTexts.Count == 1)
+            {
+                return CleanupMusic(recognizedTexts[0]);
+            }
+            
+            _logger.LogDebug($"Объединение {recognizedTexts.Count} фрагментов текста");
+            
+            // Фильтруем пустые результаты
+            recognizedTexts = recognizedTexts.Where(t => !string.IsNullOrWhiteSpace(t)).ToList();
+            
+            if (recognizedTexts.Count == 0)
+            {
+                return string.Empty;
+            }
+            
+            if (recognizedTexts.Count == 1)
+            {
+                return CleanupMusic(recognizedTexts[0]);
+            }
+            
+            // Очищаем повторяющиеся метки [музыка] в начале и конце фрагментов
+            for (int i = 0; i < recognizedTexts.Count; i++)
+            {
+                recognizedTexts[i] = CleanupMusic(recognizedTexts[i]);
+            }
+            
+            // Проверяем, насколько полезны результаты (если в основном [музыка], то лучше обработать файл целиком)
+            bool mostlyMusic = recognizedTexts.Count(t => t.Contains("[музыка]") && t.Replace("[музыка]", "").Trim().Length < 10) > recognizedTexts.Count / 2;
+            
+            if (mostlyMusic && numChunksUsed > 1)
+            {
+                _logger.LogWarning("Большинство фрагментов содержат только метки [музыка]. Рекомендуется обработать файл целиком (--num-chunks 1)");
+            }
+            
+            // Просто объединяем тексты с пробелом между ними
+            StringBuilder resultBuilder = new StringBuilder();
+            
+            foreach (var text in recognizedTexts)
+            {
+                if (!string.IsNullOrEmpty(text))
+                {
+                    if (resultBuilder.Length > 0)
+                    {
+                        resultBuilder.Append(" ");
+                    }
+                    resultBuilder.Append(text);
+                }
+            }
+            
+            // Финальная очистка результата
+            string result = resultBuilder.ToString().Trim();
+            result = CleanupMusic(result);
+            
+            return result;
         }
 
         /// <summary>
