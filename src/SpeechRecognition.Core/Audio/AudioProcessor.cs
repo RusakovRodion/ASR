@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using NAudio.Wave;
 using System.Collections.Generic;
 using System.Linq;
+using Microsoft.Extensions.Logging;
 
 namespace SpeechRecognition.Core.Audio
 {
@@ -16,6 +17,25 @@ namespace SpeechRecognition.Core.Audio
         private const int DEFAULT_SAMPLE_RATE = 16000;
         private const int DEFAULT_BITS_PER_SAMPLE = 16;
         private const int DEFAULT_CHANNELS = 1;
+        private readonly ILogger _logger;
+
+        /// <summary>
+        /// Создает новый экземпляр класса AudioProcessor
+        /// </summary>
+        public AudioProcessor()
+        {
+            // Создаем NULL логгер, если не предоставлен
+            _logger = Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+        }
+
+        /// <summary>
+        /// Создает новый экземпляр класса AudioProcessor с логгером
+        /// </summary>
+        /// <param name="logger">Логгер</param>
+        public AudioProcessor(ILogger logger)
+        {
+            _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+        }
 
         /// <summary>
         /// Подготавливает аудиоданные для распознавания
@@ -74,7 +94,10 @@ namespace SpeechRecognition.Core.Audio
                 throw new FileNotFoundException("Аудиофайл не найден", audioFilePath);
             }
 
+            // Асинхронно считываем файл
             byte[] audioData = await File.ReadAllBytesAsync(audioFilePath);
+            
+            // Подготавливаем аудиоданные
             return await PrepareAudioDataAsync(audioData);
         }
 
@@ -458,7 +481,7 @@ namespace SpeechRecognition.Core.Audio
                     // Добавляем конечную позицию
                     splitPositions.Add(totalSamples);
                     
-                    Console.WriteLine($"Обнаружено {detectedPauses.Count} пауз в аудиофайле");
+                    _logger.LogInformation($"Обнаружено {detectedPauses.Count} пауз в аудиофайле");
                     
                     if (detectedPauses.Count > 0)
                     {
@@ -516,11 +539,11 @@ namespace SpeechRecognition.Core.Audio
                         splitPositions.AddRange(actualPositions);
                         splitPositions.Add(totalSamples); // Конец файла
                         
-                        Console.WriteLine($"Файл будет разбит на {splitPositions.Count - 1} фрагментов, оптимизированных по равномерности и паузам");
+                        _logger.LogInformation($"Файл будет разбит на {splitPositions.Count - 1} фрагментов, оптимизированных по равномерности и паузам");
                     }
                     else
                     {
-                        Console.WriteLine("Паузы не обнаружены, файл будет разбит на равные части");
+                        _logger.LogInformation("Паузы не обнаружены, файл будет разбит на равные части");
                         
                         // Делим файл на равные части
                         int chunkSize = totalSamples / numChunks;
@@ -537,7 +560,7 @@ namespace SpeechRecognition.Core.Audio
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Ошибка при анализе пауз: {ex.Message}");
+                _logger.LogError(ex, "Ошибка при анализе пауз");
                 splitPositions = new List<int> { 0 };
             }
             
@@ -605,7 +628,7 @@ namespace SpeechRecognition.Core.Audio
             catch (Exception ex)
             {
                 // Логируем ошибку, чтобы упростить отладку
-                Console.WriteLine($"Ошибка при разбиении файла: {ex.Message}");
+                _logger.LogError(ex, "Ошибка при разбиении файла");
             }
             
             return chunks;
