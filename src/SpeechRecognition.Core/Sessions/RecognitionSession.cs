@@ -4,6 +4,9 @@ using System.Threading;
 using System.Threading.Tasks;
 using SpeechRecognition.Core.Recognition;
 using SpeechRecognition.Core.Events;
+using SpeechRecognition.Core.Recovery;
+using Microsoft.Extensions.Logging;
+using System.Linq;
 
 namespace SpeechRecognition.Core.Sessions
 {
@@ -36,6 +39,27 @@ namespace SpeechRecognition.Core.Sessions
         /// Обработка отменена
         /// </summary>
         Canceled
+    }
+
+    /// <summary>
+    /// Состояние очереди обработки
+    /// </summary>
+    public enum QueueState
+    {
+        /// <summary>
+        /// Очередь активна и обрабатывает фрагменты
+        /// </summary>
+        Active,
+        
+        /// <summary>
+        /// Очередь приостановлена
+        /// </summary>
+        Paused,
+        
+        /// <summary>
+        /// Очередь завершена или отменена
+        /// </summary>
+        Completed
     }
 
     /// <summary>
@@ -138,6 +162,33 @@ namespace SpeechRecognition.Core.Sessions
     }
 
     /// <summary>
+    /// Аргументы события изменения состояния очереди
+    /// </summary>
+    public class QueueStateChangedEventArgs : EventArgs
+    {
+        /// <summary>
+        /// Идентификатор сессии
+        /// </summary>
+        public Guid SessionId { get; }
+        
+        /// <summary>
+        /// Состояние очереди
+        /// </summary>
+        public QueueState State { get; }
+        
+        /// <summary>
+        /// Создает новый экземпляр класса QueueStateChangedEventArgs
+        /// </summary>
+        /// <param name="sessionId">Идентификатор сессии</param>
+        /// <param name="state">Состояние очереди</param>
+        public QueueStateChangedEventArgs(Guid sessionId, QueueState state)
+        {
+            SessionId = sessionId;
+            State = state;
+        }
+    }
+
+    /// <summary>
     /// Представляет сессию распознавания речи
     /// </summary>
     public class RecognitionSession : IDisposable
@@ -150,6 +201,10 @@ namespace SpeechRecognition.Core.Sessions
         private bool _isPaused;
         private readonly object _pauseLock = new object();
         private int _nextFragmentId;
+        private CancellationTokenSource _sessionCancellationSource;
+        private readonly ManualResetEventSlim _pauseEvent = new ManualResetEventSlim(true); // По умолчанию не приостановлено
+        private readonly ILogger _logger;
+        private RetryPolicy _retryPolicy;
 
         /// <summary>
         /// Событие, возникающее при получении результата распознавания речи
@@ -165,6 +220,11 @@ namespace SpeechRecognition.Core.Sessions
         /// Событие, возникающее при изменении статуса фрагмента
         /// </summary>
         public event EventHandler<FragmentStatusChangedEventArgs> FragmentStatusChanged;
+
+        /// <summary>
+        /// Событие изменения состояния очереди
+        /// </summary>
+        public event EventHandler<QueueStateChangedEventArgs> QueueStateChanged;
 
         /// <summary>
         /// Идентификатор сессии
@@ -205,56 +265,46 @@ namespace SpeechRecognition.Core.Sessions
         }
 
         /// <summary>
-        /// Создает новый экземпляр класса RecognitionSession
+        /// Создает новую сессию распознавания речи
         /// </summary>
         /// <param name="recognizer">Распознаватель речи</param>
-        public RecognitionSession(ISpeechRecognizer recognizer)
+        /// <param name="logger">Логгер</param>
+        public RecognitionSession(ISpeechRecognizer recognizer, ILogger logger)
         {
             _recognizer = recognizer ?? throw new ArgumentNullException(nameof(recognizer));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _fragments = new Dictionary<int, SessionFragment>();
             _processingLock = new SemaphoreSlim(1, 1);
             _fragmentLock = new SemaphoreSlim(1, 1);
-            _isDisposed = false;
-            _isPaused = false;
-            _nextFragmentId = 0;
-            
+            _sessionCancellationSource = new CancellationTokenSource();
             Id = Guid.NewGuid();
             CreationTime = DateTime.Now;
+            _nextFragmentId = 1;
+            _retryPolicy = RetryPolicyFactory.CreateForSpeechRecognition(logger);
         }
 
         /// <summary>
-        /// Добавляет фрагмент в сессию с указанным приоритетом
+        /// Добавляет фрагмент в очередь на обработку
         /// </summary>
-        /// <param name="audioData">Аудиоданные фрагмента</param>
-        /// <param name="priority">Приоритет обработки (меньшее значение - более высокий приоритет)</param>
+        /// <param name="audioData">Аудиоданные</param>
+        /// <param name="priority">Приоритет обработки</param>
         /// <param name="metadata">Пользовательские метаданные</param>
-        /// <returns>Идентификатор фрагмента</returns>
+        /// <returns>Идентификатор добавленного фрагмента</returns>
         public async Task<int> AddFragmentAsync(byte[] audioData, int priority = 0, string metadata = "")
         {
             ThrowIfDisposed();
-
-            if (audioData == null || audioData.Length == 0)
-            {
-                throw new ArgumentException("Аудиоданные не могут быть пустыми", nameof(audioData));
-            }
 
             await _fragmentLock.WaitAsync();
             try
             {
                 int fragmentId = _nextFragmentId++;
                 var fragment = new SessionFragment(fragmentId, audioData, priority, metadata);
-                
+
                 lock (_fragments)
                 {
                     _fragments.Add(fragmentId, fragment);
                 }
-                
-                if (!_isPaused)
-                {
-                    // Запускаем обработку фрагмента, если сессия не приостановлена
-                    _ = ProcessFragmentInternalAsync(fragmentId, CancellationToken.None);
-                }
-                
+
                 return fragmentId;
             }
             finally
@@ -264,308 +314,166 @@ namespace SpeechRecognition.Core.Sessions
         }
 
         /// <summary>
+        /// Получает фрагмент по идентификатору
+        /// </summary>
+        /// <param name="fragmentId">Идентификатор фрагмента</param>
+        /// <returns>Фрагмент или null, если не найден</returns>
+        public SessionFragment GetFragment(int fragmentId)
+        {
+            ThrowIfDisposed();
+
+            lock (_fragments)
+            {
+                return _fragments.TryGetValue(fragmentId, out var fragment) ? fragment : null;
+            }
+        }
+
+        /// <summary>
+        /// Получает все фрагменты с указанным статусом
+        /// </summary>
+        /// <param name="status">Статус фрагментов (null для всех статусов)</param>
+        /// <returns>Список фрагментов</returns>
+        public List<SessionFragment> GetFragments(FragmentStatus? status = null)
+        {
+            ThrowIfDisposed();
+
+            lock (_fragments)
+            {
+                var query = _fragments.Values.AsEnumerable();
+                if (status.HasValue)
+                {
+                    query = query.Where(f => f.Status == status.Value);
+                }
+                return query.ToList();
+            }
+        }
+
+        /// <summary>
         /// Изменяет приоритет фрагмента
         /// </summary>
         /// <param name="fragmentId">Идентификатор фрагмента</param>
         /// <param name="newPriority">Новый приоритет</param>
-        /// <returns>true, если приоритет успешно изменен</returns>
+        /// <returns>true, если приоритет изменен успешно</returns>
         public bool ChangeFragmentPriority(int fragmentId, int newPriority)
         {
             ThrowIfDisposed();
 
             lock (_fragments)
             {
-                if (_fragments.TryGetValue(fragmentId, out var fragment))
+                if (_fragments.TryGetValue(fragmentId, out var fragment) && fragment.Status == FragmentStatus.Pending)
                 {
-                    if (fragment.Status == FragmentStatus.Pending)
-                    {
-                        fragment.Priority = newPriority;
-                        return true;
-                    }
+                    fragment.Priority = newPriority;
+                    return true;
                 }
+                return false;
             }
-            
-            return false;
         }
 
         /// <summary>
         /// Отменяет обработку фрагмента
         /// </summary>
         /// <param name="fragmentId">Идентификатор фрагмента</param>
-        /// <returns>true, если обработка успешно отменена</returns>
+        /// <returns>true, если фрагмент отменен успешно</returns>
         public bool CancelFragment(int fragmentId)
         {
             ThrowIfDisposed();
 
             lock (_fragments)
             {
-                if (_fragments.TryGetValue(fragmentId, out var fragment))
+                if (_fragments.TryGetValue(fragmentId, out var fragment) && 
+                    (fragment.Status == FragmentStatus.Pending || fragment.Status == FragmentStatus.Processing))
                 {
-                    if (fragment.Status == FragmentStatus.Pending)
-                    {
-                        var oldStatus = fragment.Status;
-                        fragment.Status = FragmentStatus.Canceled;
-                        
-                        OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(
-                            Id, fragmentId, oldStatus, FragmentStatus.Canceled));
-                        
-                        return true;
-                    }
+                    var oldStatus = fragment.Status;
+                    fragment.Status = FragmentStatus.Canceled;
+                    OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(Id, fragmentId, oldStatus, FragmentStatus.Canceled));
+                    return true;
                 }
-            }
-            
-            return false;
-        }
-
-        /// <summary>
-        /// Приостанавливает обработку фрагментов в сессии
-        /// </summary>
-        public void Pause()
-        {
-            ThrowIfDisposed();
-            
-            lock (_pauseLock)
-            {
-                if (!_isPaused)
-                {
-                    _isPaused = true;
-                }
+                return false;
             }
         }
 
         /// <summary>
-        /// Возобновляет обработку фрагментов в сессии
-        /// </summary>
-        public void Resume()
-        {
-            ThrowIfDisposed();
-            
-            lock (_pauseLock)
-            {
-                if (_isPaused)
-                {
-                    _isPaused = false;
-                    
-                    // Запускаем обработку всех ожидающих фрагментов
-                    lock (_fragments)
-                    {
-                        var pendingFragments = _fragments.Values
-                            .Where(f => f.Status == FragmentStatus.Pending)
-                            .OrderBy(f => f.Priority)
-                            .ThenBy(f => f.AddedTime)
-                            .ToList();
-                        
-                        foreach (var fragment in pendingFragments)
-                        {
-                            _ = ProcessFragmentInternalAsync(fragment.FragmentId, CancellationToken.None);
-                        }
-                    }
-                }
-            }
-        }
-
-        /// <summary>
-        /// Получает информацию о фрагменте
-        /// </summary>
-        /// <param name="fragmentId">Идентификатор фрагмента</param>
-        /// <returns>Информация о фрагменте или null, если не найден</returns>
-        public SessionFragment GetFragment(int fragmentId)
-        {
-            ThrowIfDisposed();
-            
-            lock (_fragments)
-            {
-                if (_fragments.TryGetValue(fragmentId, out var fragment))
-                {
-                    return fragment;
-                }
-            }
-            
-            return null;
-        }
-
-        /// <summary>
-        /// Получает список всех фрагментов в сессии
-        /// </summary>
-        /// <param name="statusFilter">Фильтр по статусу (null для всех фрагментов)</param>
-        /// <returns>Список фрагментов</returns>
-        public IReadOnlyList<SessionFragment> GetFragments(FragmentStatus? statusFilter = null)
-        {
-            ThrowIfDisposed();
-            
-            lock (_fragments)
-            {
-                // Получаем список фрагментов из словаря
-                List<SessionFragment> fragments = _fragments.Values.ToList();
-                
-                if (statusFilter.HasValue)
-                {
-                    fragments = fragments.Where(f => f.Status == statusFilter.Value).ToList();
-                }
-                
-                return fragments.OrderBy(f => f.Priority).ThenBy(f => f.FragmentId).ToList();
-            }
-        }
-
-        /// <summary>
-        /// Очищает ожидающие фрагменты из сессии
+        /// Очищает все ожидающие фрагменты
         /// </summary>
         public void ClearPendingFragments()
         {
             ThrowIfDisposed();
-            
+
             lock (_fragments)
             {
                 var pendingFragments = _fragments.Values
                     .Where(f => f.Status == FragmentStatus.Pending)
                     .ToList();
-                
+
                 foreach (var fragment in pendingFragments)
                 {
                     var oldStatus = fragment.Status;
                     fragment.Status = FragmentStatus.Canceled;
-                    
-                    OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(
-                        Id, fragment.FragmentId, oldStatus, FragmentStatus.Canceled));
+                    OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(Id, fragment.FragmentId, oldStatus, FragmentStatus.Canceled));
                 }
             }
         }
 
         /// <summary>
-        /// Обрабатывает фрагмент аудиоданных в рамках сессии
+        /// Приостанавливает обработку очереди
         /// </summary>
-        /// <param name="audioFragment">Фрагмент аудиоданных</param>
-        /// <param name="cancellationToken">Токен отмены операции</param>
-        /// <returns>Результат распознавания</returns>
-        public async Task<RecognitionResult> ProcessFragmentAsync(byte[] audioFragment, CancellationToken cancellationToken = default)
+        public void PauseProcessing()
         {
-            ThrowIfDisposed();
-
-            if (audioFragment == null || audioFragment.Length == 0)
+            lock (_pauseLock)
             {
-                throw new ArgumentException("Аудиофрагмент не может быть пустым", nameof(audioFragment));
-            }
-
-            int fragmentId = await AddFragmentAsync(audioFragment);
-            
-            // Ждем результат обработки фрагмента
-            while (true)
-            {
-                SessionFragment fragment;
-                lock (_fragments)
+                if (!_isPaused)
                 {
-                    if (!_fragments.TryGetValue(fragmentId, out fragment))
-                    {
-                        return null;
-                    }
+                    _isPaused = true;
+                    _pauseEvent.Reset(); // Сигнализирует о приостановке
                     
-                    if (fragment.Status == FragmentStatus.Completed)
-                    {
-                        return fragment.Result;
-                    }
-                    
-                    if (fragment.Status == FragmentStatus.Failed || fragment.Status == FragmentStatus.Canceled)
-                    {
-                        return null;
-                    }
+                    // Вызываем событие изменения состояния очереди
+                    OnQueueStateChanged(new QueueStateChangedEventArgs(Id, QueueState.Paused));
                 }
-                
-                await Task.Delay(100, cancellationToken);
-                cancellationToken.ThrowIfCancellationRequested();
+            }
+        }
+        
+        /// <summary>
+        /// Возобновляет обработку очереди
+        /// </summary>
+        public void ResumeProcessing()
+        {
+            lock (_pauseLock)
+            {
+                if (_isPaused)
+                {
+                    _isPaused = false;
+                    _pauseEvent.Set(); // Сигнализирует о возобновлении
+                    
+                    // Вызываем событие изменения состояния очереди
+                    OnQueueStateChanged(new QueueStateChangedEventArgs(Id, QueueState.Active));
+                }
             }
         }
 
-        private async Task ProcessFragmentInternalAsync(int fragmentId, CancellationToken cancellationToken)
+        /// <summary>
+        /// Отменяет все текущие операции и освобождает ресурсы
+        /// </summary>
+        public void Dispose()
         {
-            SessionFragment fragment;
-            lock (_fragments)
-            {
-                if (!_fragments.TryGetValue(fragmentId, out fragment) || fragment.Status != FragmentStatus.Pending)
-                {
-                    return;
-                }
-                
-                // Проверяем, не приостановлена ли сессия
-                if (_isPaused)
-                {
-                    return;
-                }
-                
-                // Изменяем статус на "в обработке"
-                var oldStatus = fragment.Status;
-                fragment.Status = FragmentStatus.Processing;
-                
-                OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(
-                    Id, fragmentId, oldStatus, FragmentStatus.Processing));
-            }
-            
-            try
-            {
-                // Ожидаем доступ к распознавателю
-                await _processingLock.WaitAsync(cancellationToken);
-                
-                var startTime = DateTime.Now;
-                
-                // Уведомляем о начале распознавания
-                var initialResult = new RecognitionResult(Id, fragmentId, string.Empty, startTime, DateTime.MinValue);
-                OnRecognitionStarted(new RecognitionEventArgs(initialResult));
-                
-                // Распознаем аудиоданные
-                string recognizedText = await _recognizer.RecognizeSpeechAsync(fragment.AudioData, cancellationToken);
-                
-                var endTime = DateTime.Now;
-                
-                // Создаем результат распознавания
-                var result = new RecognitionResult(Id, fragmentId, recognizedText, startTime, endTime);
-                
-                lock (_fragments)
-                {
-                    if (_fragments.TryGetValue(fragmentId, out var updatedFragment) && updatedFragment.Status == FragmentStatus.Processing)
-                    {
-                        var oldStatus = updatedFragment.Status;
-                        updatedFragment.Status = FragmentStatus.Completed;
-                        updatedFragment.Result = result;
-                        
-                        OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(
-                            Id, fragmentId, oldStatus, FragmentStatus.Completed));
-                        
-                        // Уведомляем о завершении распознавания
-                        OnRecognitionCompleted(new RecognitionEventArgs(result));
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                lock (_fragments)
-                {
-                    if (_fragments.TryGetValue(fragmentId, out var updatedFragment) && updatedFragment.Status == FragmentStatus.Processing)
-                    {
-                        var oldStatus = updatedFragment.Status;
-                        updatedFragment.Status = FragmentStatus.Canceled;
-                        
-                        OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(
-                            Id, fragmentId, oldStatus, FragmentStatus.Canceled));
-                    }
-                }
-            }
-            catch (Exception)
-            {
-                lock (_fragments)
-                {
-                    if (_fragments.TryGetValue(fragmentId, out var updatedFragment) && updatedFragment.Status == FragmentStatus.Processing)
-                    {
-                        var oldStatus = updatedFragment.Status;
-                        updatedFragment.Status = FragmentStatus.Failed;
-                        
-                        OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(
-                            Id, fragmentId, oldStatus, FragmentStatus.Failed));
-                    }
-                }
-            }
-            finally
-            {
-                _processingLock.Release();
-            }
+            if (_isDisposed)
+                return;
+
+            _isDisposed = true;
+            _sessionCancellationSource?.Cancel();
+            _sessionCancellationSource?.Dispose();
+            _processingLock?.Dispose();
+            _fragmentLock?.Dispose();
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (_isDisposed)
+                throw new ObjectDisposedException(nameof(RecognitionSession));
+        }
+
+        protected virtual void OnFragmentStatusChanged(FragmentStatusChangedEventArgs e)
+        {
+            FragmentStatusChanged?.Invoke(this, e);
         }
 
         protected virtual void OnRecognitionStarted(RecognitionEventArgs e)
@@ -578,32 +486,420 @@ namespace SpeechRecognition.Core.Sessions
             RecognitionCompleted?.Invoke(this, e);
         }
 
-        protected virtual void OnFragmentStatusChanged(FragmentStatusChangedEventArgs e)
+        protected virtual void OnQueueStateChanged(QueueStateChangedEventArgs e)
         {
-            FragmentStatusChanged?.Invoke(this, e);
+            QueueStateChanged?.Invoke(this, e);
         }
 
         /// <summary>
-        /// Освобождает ресурсы
+        /// Асинхронно обрабатывает фрагмент аудио
         /// </summary>
-        public void Dispose()
+        /// <param name="fragmentId">Идентификатор фрагмента</param>
+        /// <returns>Результат распознавания или null, если фрагмент не найден или отменен</returns>
+        public Task<RecognitionResult> ProcessFragmentAsync(int fragmentId)
         {
-            if (_isDisposed)
-            {
-                return;
-            }
-
-            _processingLock.Dispose();
-            _fragmentLock.Dispose();
-            _isDisposed = true;
-            GC.SuppressFinalize(this);
+            return ProcessFragmentAsync(fragmentId, CancellationToken.None);
         }
 
-        private void ThrowIfDisposed()
+        /// <summary>
+        /// Асинхронно обрабатывает фрагмент аудио
+        /// </summary>
+        /// <param name="fragmentId">Идентификатор фрагмента</param>
+        /// <param name="cancellationToken">Токен отмены операции</param>
+        /// <returns>Результат распознавания или null, если фрагмент не найден или отменен</returns>
+        public async Task<RecognitionResult> ProcessFragmentAsync(int fragmentId, CancellationToken cancellationToken)
         {
-            if (_isDisposed)
+            ThrowIfDisposed();
+
+            if (cancellationToken.IsCancellationRequested)
             {
-                throw new ObjectDisposedException(nameof(RecognitionSession));
+                throw new OperationCanceledException(cancellationToken);
+            }
+
+            // Проверка и подготовка фрагмента
+            SessionFragment fragment;
+            lock (_fragments)
+            {
+                if (!_fragments.TryGetValue(fragmentId, out fragment))
+                {
+                    return null;
+                }
+
+                if (fragment.Status == FragmentStatus.Completed)
+                {
+                    return fragment.Result;
+                }
+
+                if (fragment.Status == FragmentStatus.Failed || fragment.Status == FragmentStatus.Canceled)
+                {
+                    return null;
+                }
+
+                var oldStatus = fragment.Status;
+                fragment.Status = FragmentStatus.Processing;
+                OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(Id, fragmentId, oldStatus, FragmentStatus.Processing));
+            }
+
+            int attemptCount = 0;
+            const int maxAttempts = 3;
+
+            while (attemptCount < maxAttempts && !cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    // Ожидаем доступ к распознавателю
+                    await _processingLock.WaitAsync(cancellationToken);
+
+                    try
+                    {
+                        // Используем политику восстановления для распознавания
+                        return await _retryPolicy.ExecuteAsync(async (token) =>
+                        {
+                            var startTime = DateTime.Now;
+                            var recognizedText = await _recognizer.RecognizeSpeechAsync(fragment.AudioData, token);
+                            var endTime = DateTime.Now;
+
+                            var result = new RecognitionResult(Id, fragmentId, recognizedText, startTime, endTime);
+
+                            lock (_fragments)
+                            {
+                                if (_fragments.TryGetValue(fragmentId, out var updatedFragment))
+                                {
+                                    var oldStatus = updatedFragment.Status;
+                                    updatedFragment.Status = FragmentStatus.Completed;
+                                    updatedFragment.Result = result;
+                                    OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(Id, fragmentId, oldStatus, FragmentStatus.Completed));
+                                }
+                            }
+
+                            return result;
+                        }, $"Распознавание фрагмента {fragmentId}", cancellationToken);
+                    }
+                    finally
+                    {
+                        _processingLock.Release();
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // Обработка отменена, устанавливаем статус и выходим
+                    lock (_fragments)
+                    {
+                        if (_fragments.TryGetValue(fragmentId, out fragment))
+                        {
+                            var oldStatus = fragment.Status;
+                            fragment.Status = FragmentStatus.Canceled;
+                            OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(Id, fragmentId, oldStatus, FragmentStatus.Canceled));
+                        }
+                    }
+                    throw; // Пробрасываем исключение для корректной обработки вызывающим кодом
+                }
+                catch (Exception ex)
+                {
+                    // Обработка ошибки
+                    attemptCount++;
+                    _logger.LogWarning(ex, $"Ошибка при обработке фрагмента {fragmentId}. Попытка {attemptCount} из {maxAttempts}");
+
+                    // Если исчерпаны все попытки, устанавливаем статус ошибки
+                    if (attemptCount >= maxAttempts)
+                    {
+                        lock (_fragments)
+                        {
+                            if (_fragments.TryGetValue(fragmentId, out fragment))
+                            {
+                                var oldStatus = fragment.Status;
+                                fragment.Status = FragmentStatus.Failed;
+                                OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(Id, fragmentId, oldStatus, FragmentStatus.Failed));
+                            }
+                        }
+                        _logger.LogError(ex, $"Фрагмент {fragmentId} не может быть обработан после {maxAttempts} попыток");
+                        return null;
+                    }
+
+                    // Добавляем задержку перед следующей попыткой
+                    int delayMs = 500 * (int)Math.Pow(2, attemptCount - 1); // Экспоненциальная задержка
+                    _logger.LogInformation($"Повторная попытка через {delayMs} мс...");
+                    
+                    try
+                    {
+                        await Task.Delay(delayMs, cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Задержка отменена, выходим из цикла
+                        lock (_fragments)
+                        {
+                            if (_fragments.TryGetValue(fragmentId, out fragment))
+                            {
+                                var oldStatus = fragment.Status;
+                                fragment.Status = FragmentStatus.Canceled;
+                                OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(Id, fragmentId, oldStatus, FragmentStatus.Canceled));
+                            }
+                        }
+                        throw;
+                    }
+                }
+            }
+
+            // Этот код выполняется только если cancellationToken.IsCancellationRequested == true
+            // и исключение не было выброшено в блоке catch
+            if (cancellationToken.IsCancellationRequested)
+            {
+                lock (_fragments)
+                {
+                    if (_fragments.TryGetValue(fragmentId, out fragment))
+                    {
+                        var oldStatus = fragment.Status;
+                        fragment.Status = FragmentStatus.Canceled;
+                        OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(Id, fragmentId, oldStatus, FragmentStatus.Canceled));
+                    }
+                }
+                throw new OperationCanceledException(cancellationToken);
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Отменяет все фрагменты в сессии
+        /// </summary>
+        public void CancelAllFragments()
+        {
+            ThrowIfDisposed();
+
+            // Отменяем текущий токен отмены для сессии
+            var oldCts = Interlocked.Exchange(ref _sessionCancellationSource, new CancellationTokenSource());
+            try
+            {
+                oldCts?.Cancel();
+                oldCts?.Dispose();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Игнорируем, если токен уже был освобожден
+            }
+
+            lock (_fragments)
+            {
+                foreach (var fragment in _fragments.Values.Where(f => 
+                    f.Status == FragmentStatus.Pending || f.Status == FragmentStatus.Processing))
+                {
+                    var oldStatus = fragment.Status;
+                    fragment.Status = FragmentStatus.Canceled;
+                    OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(Id, fragment.FragmentId, oldStatus, FragmentStatus.Canceled));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Запускает асинхронную обработку фрагментов с учетом приоритета
+        /// </summary>
+        /// <param name="maxParallelProcessing">Максимальное количество одновременно обрабатываемых фрагментов</param>
+        /// <returns>Задача, представляющая асинхронную операцию</returns>
+        public Task ProcessQueueAsync(int maxParallelProcessing = 1)
+        {
+            return ProcessQueueAsync(maxParallelProcessing, CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Запускает асинхронную обработку фрагментов с учетом приоритета
+        /// </summary>
+        /// <param name="maxParallelProcessing">Максимальное количество одновременно обрабатываемых фрагментов</param>
+        /// <param name="cancellationToken">Токен отмены операции</param>
+        /// <returns>Задача, представляющая асинхронную операцию</returns>
+        public async Task ProcessQueueAsync(int maxParallelProcessing, CancellationToken cancellationToken)
+        {
+            ThrowIfDisposed();
+
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken, _sessionCancellationSource.Token);
+            var combinedToken = linkedCts.Token;
+
+            using var parallelLock = new SemaphoreSlim(maxParallelProcessing, maxParallelProcessing);
+            var processingTasks = new List<Task>();
+
+            try
+            {
+                while (!combinedToken.IsCancellationRequested)
+                {
+                    // Проверяем состояние паузы перед обработкой фрагментов
+                    bool isPaused;
+                    lock (_pauseLock)
+                    {
+                        isPaused = _isPaused;
+                    }
+
+                    if (isPaused)
+                    {
+                        // Ожидаем сигнала о возобновлении
+                        if (!_pauseEvent.Wait(100, combinedToken))
+                        {
+                            // Если пауза все еще активна, переходим к следующей итерации
+                            continue;
+                        }
+                    }
+
+                    var pendingFragments = GetPendingFragments();
+                    if (!pendingFragments.Any())
+                    {
+                        await Task.Delay(100, combinedToken);
+                        continue;
+                    }
+
+                    foreach (var fragment in pendingFragments)
+                    {
+                        await parallelLock.WaitAsync(combinedToken);
+
+                        var processingTask = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await ProcessFragmentAsync(fragment.FragmentId, combinedToken);
+                            }
+                            finally
+                            {
+                                parallelLock.Release();
+                            }
+                        }, combinedToken);
+
+                        processingTasks.Add(processingTask);
+                        processingTasks.RemoveAll(t => t.IsCompleted);
+                    }
+                }
+
+                // Если дошли сюда и токен отменен, пробрасываем исключение
+                combinedToken.ThrowIfCancellationRequested();
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException("Ошибка при обработке очереди фрагментов", ex);
+            }
+        }
+
+        private List<SessionFragment> GetPendingFragments()
+        {
+            lock (_fragments)
+            {
+                return _fragments.Values
+                    .Where(f => f.Status == FragmentStatus.Pending)
+                    .OrderBy(f => f.Priority)
+                    .ThenBy(f => f.AddedTime)
+                    .ToList();
+            }
+        }
+
+        /// <summary>
+        /// Повторно обрабатывает фрагмент, завершившийся с ошибкой
+        /// </summary>
+        /// <param name="fragmentId">Идентификатор фрагмента</param>
+        /// <returns>True если фрагмент поставлен на повторную обработку, иначе false</returns>
+        public bool RetryFailedFragment(int fragmentId)
+        {
+            return RetryFailedFragment(fragmentId, CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Повторно обрабатывает фрагмент, завершившийся с ошибкой
+        /// </summary>
+        /// <param name="fragmentId">Идентификатор фрагмента</param>
+        /// <param name="cancellationToken">Токен отмены</param>
+        /// <returns>True если фрагмент поставлен на повторную обработку, иначе false</returns>
+        public bool RetryFailedFragment(int fragmentId, CancellationToken cancellationToken)
+        {
+            ThrowIfDisposed();
+
+            lock (_fragments)
+            {
+                if (_fragments.TryGetValue(fragmentId, out var fragment) && fragment.Status == FragmentStatus.Failed)
+                {
+                    var oldStatus = fragment.Status;
+                    fragment.Status = FragmentStatus.Pending;
+                    OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(Id, fragmentId, oldStatus, FragmentStatus.Pending));
+                    
+                    // Запускаем обработку асинхронно
+                    _ = Task.Run(async () => 
+                    {
+                        try 
+                        {
+                            await ProcessFragmentAsync(fragmentId, cancellationToken);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, $"Ошибка при повторной обработке фрагмента {fragmentId}");
+                        }
+                    }, cancellationToken);
+                    
+                    return true;
+                }
+                
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Повторно обрабатывает все фрагменты, завершившиеся с ошибкой
+        /// </summary>
+        /// <param name="cancellationToken">Токен отмены</param>
+        /// <returns>Количество фрагментов, поставленных на повторную обработку</returns>
+        public int RetryAllFailedFragments(CancellationToken cancellationToken = default)
+        {
+            ThrowIfDisposed();
+
+            int retryCount = 0;
+            
+            lock (_fragments)
+            {
+                foreach (var fragment in _fragments.Values.Where(f => f.Status == FragmentStatus.Failed).ToList())
+                {
+                    var oldStatus = fragment.Status;
+                    fragment.Status = FragmentStatus.Pending;
+                    OnFragmentStatusChanged(new FragmentStatusChangedEventArgs(Id, fragment.FragmentId, oldStatus, FragmentStatus.Pending));
+                    retryCount++;
+                }
+            }
+            
+            // Если есть фрагменты для повторной обработки, запускаем обработку очереди
+            if (retryCount > 0)
+            {
+                _ = Task.Run(async () => 
+                {
+                    try
+                    {
+                        await ProcessQueueAsync(1, cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Ошибка при обработке очереди повторных попыток");
+                    }
+                }, cancellationToken);
+            }
+            
+            return retryCount;
+        }
+
+        /// <summary>
+        /// Получает количество фрагментов с определенным статусом
+        /// </summary>
+        /// <param name="status">Статус (null для подсчета всех фрагментов)</param>
+        /// <returns>Количество фрагментов</returns>
+        public int GetFragmentsCount(FragmentStatus? status = null)
+        {
+            ThrowIfDisposed();
+            
+            lock (_fragments)
+            {
+                if (status.HasValue)
+                {
+                    return _fragments.Values.Count(f => f.Status == status.Value);
+                }
+                else
+                {
+                    return _fragments.Count;
+                }
             }
         }
     }

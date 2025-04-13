@@ -2,28 +2,49 @@ using System;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using SpeechRecognition.Core.Audio;
+using SpeechRecognition.Core.Models;
+using SpeechRecognition.Core.Recovery;
 using Whisper.net;
-using Whisper.net.Ggml;
 
 namespace SpeechRecognition.Core.Recognition
 {
     /// <summary>
-    /// Класс для распознавания речи с использованием модели Whisper
+    /// Распознаватель речи, использующий модель Whisper от OpenAI
     /// </summary>
-    public class WhisperRecognizer : ISpeechRecognizer
+    public class WhisperRecognizer : BaseSpeechRecognizer
     {
-        private readonly IAudioProcessor _audioProcessor;
-        private WhisperFactory? _whisperFactory;
-        private Whisper.net.WhisperProcessor? _whisperProcessor;
-        private readonly string _language;
-        private bool _isInitialized;
-        private bool _isDisposed;
+        private readonly ILogger _logger;
+        private WhisperModelSettings _whisperSettings;
+        private WhisperFactory _whisperFactory;
+        private WhisperProcessor _whisperProcessor;
+        private RetryPolicy _retryPolicy;
 
         /// <summary>
-        /// Путь к файлу модели
+        /// Получает тип распознавателя
         /// </summary>
-        public string ModelPath { get; }
+        public override RecognizerType RecognizerType => RecognizerType.Whisper;
+
+        /// <summary>
+        /// Создает новый экземпляр класса WhisperRecognizer
+        /// </summary>
+        /// <param name="audioProcessor">Процессор аудио для подготовки данных</param>
+        /// <param name="modelSettings">Настройки модели</param>
+        /// <param name="logger">Логгер</param>
+        public WhisperRecognizer(IAudioProcessor audioProcessor, IModelSettings modelSettings, ILogger logger) 
+            : base(audioProcessor, modelSettings)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            
+            if (modelSettings is not WhisperModelSettings)
+            {
+                throw new ArgumentException("Требуются настройки модели Whisper", nameof(modelSettings));
+            }
+            
+            _whisperSettings = (WhisperModelSettings)modelSettings;
+            _retryPolicy = RetryPolicyFactory.CreateForSpeechRecognition(logger);
+        }
 
         /// <summary>
         /// Создает новый экземпляр класса WhisperRecognizer
@@ -31,26 +52,21 @@ namespace SpeechRecognition.Core.Recognition
         /// <param name="audioProcessor">Процессор аудио для подготовки данных</param>
         /// <param name="modelPath">Путь к файлу модели Whisper</param>
         /// <param name="language">Код языка (по умолчанию "ru" - русский)</param>
-        public WhisperRecognizer(IAudioProcessor audioProcessor, string modelPath, string language = "ru")
+        /// <param name="modelType">Тип модели (tiny, base)</param>
+        /// <param name="logger">Логгер</param>
+        public WhisperRecognizer(IAudioProcessor audioProcessor, string modelPath, string language, string modelType, ILogger logger)
+            : base(audioProcessor, new WhisperModelSettings(modelPath, language, modelType))
         {
-            _audioProcessor = audioProcessor ?? throw new ArgumentNullException(nameof(audioProcessor));
-            
-            if (string.IsNullOrEmpty(modelPath))
-            {
-                throw new ArgumentException("Путь к модели не может быть пустым", nameof(modelPath));
-            }
-
-            ModelPath = modelPath;
-            _language = string.IsNullOrEmpty(language) ? "ru" : language;
-            _isInitialized = false;
-            _isDisposed = false;
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _whisperSettings = (WhisperModelSettings)ModelSettings;
+            _retryPolicy = RetryPolicyFactory.CreateForSpeechRecognition(logger);
         }
 
         /// <summary>
         /// Инициализирует распознаватель речи, загружая модель Whisper
         /// </summary>
         /// <returns>Task, представляющий асинхронную операцию инициализации</returns>
-        public async Task InitializeAsync()
+        public override async Task InitializeAsync()
         {
             if (_isInitialized)
             {
@@ -59,41 +75,47 @@ namespace SpeechRecognition.Core.Recognition
 
             ThrowIfDisposed();
 
-            if (!File.Exists(ModelPath))
+            if (!File.Exists(_whisperSettings.ModelPath))
             {
-                throw new FileNotFoundException("Файл модели не найден", ModelPath);
+                throw new FileNotFoundException("Файл модели не найден", _whisperSettings.ModelPath);
             }
 
-            try
+            // Используем политику восстановления для инициализации модели
+            var initializationPolicy = RetryPolicyFactory.CreateForModelInitialization(_logger);
+            
+            await initializationPolicy.ExecuteAsync(async (cancellationToken) =>
             {
-                _whisperFactory = WhisperFactory.FromPath(ModelPath);
-                _whisperProcessor = _whisperFactory.CreateBuilder()
-                    .WithLanguage(_language)
-                    .Build();
+                try
+                {
+                    _whisperFactory = WhisperFactory.FromPath(_whisperSettings.ModelPath);
+                    _whisperProcessor = _whisperFactory.CreateBuilder()
+                        .WithLanguage(_whisperSettings.Language)
+                        .Build();
 
-                _isInitialized = true;
-            }
-            catch (Exception ex)
-            {
-                throw new InvalidOperationException("Ошибка инициализации модели Whisper", ex);
-            }
-
-            await Task.CompletedTask;
+                    _isInitialized = true;
+                    _logger.LogInformation($"Модель Whisper успешно инициализирована: {_whisperSettings.ModelPath}");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Ошибка при инициализации модели Whisper");
+                    throw new InvalidOperationException("Ошибка при инициализации модели Whisper", ex);
+                }
+            }, "Инициализация модели Whisper");
         }
 
         /// <summary>
         /// Распознает речь из аудиоданных
         /// </summary>
-        /// <param name="audioData">Аудиоданные в формате WAV</param>
+        /// <param name="audioData">Аудиоданные</param>
         /// <param name="cancellationToken">Токен отмены операции</param>
         /// <returns>Результат распознавания речи</returns>
-        public async Task<string> RecognizeSpeechAsync(byte[] audioData, CancellationToken cancellationToken = default)
+        public override async Task<string> RecognizeSpeechAsync(byte[] audioData, CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
 
             if (!_isInitialized)
             {
-                await InitializeAsync();
+                throw new InvalidOperationException("Распознаватель речи не инициализирован. Вызовите InitializeAsync() перед использованием.");
             }
 
             if (audioData == null || audioData.Length == 0)
@@ -101,32 +123,29 @@ namespace SpeechRecognition.Core.Recognition
                 throw new ArgumentException("Аудиоданные не могут быть пустыми", nameof(audioData));
             }
 
-            try
+            // Используем политику восстановления для распознавания речи
+            return await _retryPolicy.ExecuteAsync(async (token) =>
             {
-                // Подготавливаем аудиоданные (убеждаемся, что они в формате WAV с нужными параметрами)
-                byte[] preparedAudioData = await _audioProcessor.PrepareAudioDataAsync(audioData);
-
-                using (var memoryStream = new MemoryStream(preparedAudioData))
+                try
                 {
+                    using var audioStream = new MemoryStream(audioData);
                     var result = new System.Text.StringBuilder();
-
-                    // Выполняем распознавание
-                    await foreach (var segment in _whisperProcessor!.ProcessAsync(memoryStream, cancellationToken))
+                    
+                    await foreach (var segment in _whisperProcessor.ProcessAsync(audioStream, token))
                     {
                         result.Append(segment.Text);
                     }
-
-                    return result.ToString();
+                    
+                    var recognizedText = result.ToString();
+                    _logger.LogDebug($"Распознано успешно: {recognizedText.Substring(0, Math.Min(50, recognizedText.Length))}...");
+                    return recognizedText;
                 }
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                throw new InvalidOperationException("Ошибка при распознавании речи", ex);
-            }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Ошибка при распознавании речи");
+                    throw;
+                }
+            }, "Распознавание речи Whisper", cancellationToken);
         }
 
         /// <summary>
@@ -135,7 +154,7 @@ namespace SpeechRecognition.Core.Recognition
         /// <param name="audioFilePath">Путь к аудиофайлу</param>
         /// <param name="cancellationToken">Токен отмены операции</param>
         /// <returns>Результат распознавания речи</returns>
-        public async Task<string> RecognizeSpeechFromFileAsync(string audioFilePath, CancellationToken cancellationToken = default)
+        public override async Task<string> RecognizeSpeechFromFileAsync(string audioFilePath, CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
 
@@ -149,17 +168,20 @@ namespace SpeechRecognition.Core.Recognition
                 throw new FileNotFoundException("Аудиофайл не найден", audioFilePath);
             }
 
-            // Подготавливаем аудиоданные из файла
-            byte[] audioData = await _audioProcessor.PrepareAudioFileAsync(audioFilePath);
+            // Загружаем аудиофайл
+            var audioData = await File.ReadAllBytesAsync(audioFilePath, cancellationToken);
             
-            // Распознаем речь
-            return await RecognizeSpeechAsync(audioData, cancellationToken);
+            // Проверяем формат файла и при необходимости преобразуем
+            var processedAudio = await _audioProcessor.PrepareAudioFileAsync(audioFilePath);
+            
+            // Выполняем распознавание с поддержкой восстановления
+            return await RecognizeSpeechAsync(processedAudio, cancellationToken);
         }
 
         /// <summary>
-        /// Освобождает ресурсы модели
+        /// Освобождает ресурсы
         /// </summary>
-        public void Dispose()
+        public override void Dispose()
         {
             if (_isDisposed)
             {
@@ -168,17 +190,9 @@ namespace SpeechRecognition.Core.Recognition
 
             _whisperProcessor?.Dispose();
             _whisperFactory?.Dispose();
-            
+
             _isDisposed = true;
             GC.SuppressFinalize(this);
-        }
-
-        private void ThrowIfDisposed()
-        {
-            if (_isDisposed)
-            {
-                throw new ObjectDisposedException(nameof(WhisperRecognizer));
-            }
         }
     }
 } 

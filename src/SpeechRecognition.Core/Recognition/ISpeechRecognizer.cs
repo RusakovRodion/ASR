@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using SpeechRecognition.Core.Models;
 
 namespace SpeechRecognition.Core.Recognition
 {
@@ -9,6 +10,16 @@ namespace SpeechRecognition.Core.Recognition
     /// </summary>
     public interface ISpeechRecognizer : IDisposable
     {
+        /// <summary>
+        /// Получает тип распознавателя
+        /// </summary>
+        RecognizerType RecognizerType { get; }
+
+        /// <summary>
+        /// Получает настройки модели
+        /// </summary>
+        IModelSettings ModelSettings { get; }
+
         /// <summary>
         /// Инициализирует распознаватель речи
         /// </summary>

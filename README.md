@@ -1,99 +1,298 @@
-# Система автоматического распознавания речи (ASR)
+# SpeechRecognition - система автоматического распознавания речи
 
-Программный комплекс для автоматического распознавания речи, разработанный для обработки аудиофрагментов, нарезанных по тишине внешним приложением.
+Система автоматического распознавания речи (ASR) для обработки аудиофрагментов, нарезанных по тишине внешним приложением.
 
-## Особенности
+## Оглавление
 
-- Распознавание русской речи с использованием модели Whisper
-- Поддержка как целых WAV-файлов, так и потоковых фрагментов PCM-данных
-- Асинхронная обработка аудиоданных
+- [Обзор](#обзор)
+- [Возможности](#возможности)
+- [Архитектура](#архитектура)
+  - [Основные компоненты](#основные-компоненты)
+  - [Поток данных](#поток-данных)
+- [Начало работы](#начало-работы)
+  - [Системные требования](#системные-требования)
+  - [Установка](#установка)
+  - [Настройка](#настройка)
+- [Использование](#использование)
+  - [Консольное приложение](#консольное-приложение)
+  - [Интеграция в приложения](#интеграция-в-приложения)
+  - [Примеры использования](#примеры-использования)
+- [Расширение функциональности](#расширение-функциональности)
+  - [Добавление новых моделей распознавания](#добавление-новых-моделей-распознавания)
+- [Управление сессиями и очередью распознавания](#управление-сессиями-и-очередью-распознавания)
+- [Обработка ошибок и восстановление](#обработка-ошибок-и-восстановление)
+- [Тестирование](#тестирование)
+- [Лицензия](#лицензия)
+
+## Обзор
+
+SpeechRecognition - это программный комплекс для автоматического распознавания речи, разработанный для обработки аудиофрагментов, нарезанных по тишине внешним приложением. Система обеспечивает высокую точность распознавания русской речи, поддерживает различные модели распознавания и предоставляет асинхронную обработку аудиоданных.
+
+## Возможности
+
+- Распознавание речи на русском языке с использованием модели Whisper от OpenAI
+- Потоковая обработка аудиофрагментов
+- Обработка WAV-файлов
+- Асинхронная обработка с очередями и приоритетами
 - Управление сессиями распознавания
-- Добавление WAV-заголовков к PCM-данным
-- Ресемплирование аудио при необходимости
+- Механизмы восстановления после ошибок
+- Расширяемая архитектура для добавления новых моделей
+- Консольный интерфейс для тестирования
 
-## Структура проекта
+## Архитектура
 
-- **SpeechRecognition.Core** - основная библиотека для распознавания речи
-  - **Audio** - компоненты для обработки аудиоданных
-  - **Recognition** - компоненты для распознавания речи
-  - **Sessions** - компоненты для управления сессиями распознавания
-  - **Utils** - вспомогательные утилиты
-- **SpeechRecognition.Console** - консольное приложение для демонстрации работы
+### Основные компоненты
 
-## Требования
+Система построена на основе модульной архитектуры с четким разделением обязанностей:
 
-- .NET 9.0 или выше
-- Модель Whisper (ggml-tiny.bin или аналогичная)
+1. **AudioProcessor** - обрабатывает и подготавливает аудиоданные для распознавания
+   - Добавляет WAV-заголовки к PCM-данным
+   - Осуществляет ресемплирование при необходимости
+   - Конвертирует аудиоформаты
 
-## Установка
+2. **Speech Recognizers** - компоненты распознавания речи
+   - `WhisperRecognizer` - использует модель Whisper от OpenAI
+   - `MockSpeechRecognizer` - реализация для тестирования
+   - `CustomSpeechRecognizer` - пользовательская реализация для расширения
+   - `BaseSpeechRecognizer` - базовый класс для всех распознавателей
 
-1. Клонировать репозиторий:
-```bash
-git clone https://github.com/username/speech-recognition.git
-cd speech-recognition
-```
+3. **SessionManager** - управляет сессиями распознавания
+   - Координирует обработку фрагментов
+   - Управляет очередью распознавания
+   - Обеспечивает асинхронную обработку
 
-2. Построить проект:
-```bash
-dotnet build
-```
+4. **RecognitionSession** - представляет сессию распознавания
+   - Хранит информацию о фрагментах
+   - Управляет статусами обработки
+   - Обрабатывает результаты распознавания
 
-3. Скачать модель Whisper:
-```bash
-mkdir models
-# Скачайте модель Whisper в формате GGML из официального репозитория
-# и поместите ее в директорию models
-```
+5. **Models** - управление моделями распознавания
+   - `IModelSettings` - настройки моделей
+   - `IModelProvider` - загрузка и управление моделями
+   - `ModelDownloader` - загрузка моделей из внешних источников
+
+6. **Recovery** - механизмы восстановления после ошибок
+   - `RetryPolicy` - политика повторных попыток
+   - `RetryPolicyFactory` - фабрика политик восстановления
+
+7. **Events** - система событий для оповещения о процессе распознавания
+   - `RecognitionEventArgs` - события распознавания
+   - `RecognitionErrorEventArgs` - события ошибок
+   - `SessionEventArgs` - события сессий
+
+### Поток данных
+
+1. Аудиоданные поступают в `AudioProcessor` для подготовки
+2. `SpeechRecognitionService` отправляет подготовленные данные в распознаватель
+3. Распознавание выполняется с помощью `ISpeechRecognizer` (например, WhisperRecognizer)
+4. Результаты собираются и обрабатываются через `SessionManager`
+5. События распознавания передаются клиентскому приложению
+
+## Начало работы
+
+### Системные требования
+
+- **.NET 7.0** или выше
+- Windows, Linux или macOS
+- Минимум 4 ГБ оперативной памяти (рекомендуется 8 ГБ+)
+- Для использования GPU-ускорения требуется совместимая видеокарта с поддержкой CUDA
+
+### Установка
+
+1. Клонируйте репозиторий:
+   ```
+   git clone https://github.com/your-username/speechRecognition.git
+   ```
+
+2. Перейдите в директорию проекта:
+   ```
+   cd speechRecognition
+   ```
+
+3. Соберите проект:
+   ```
+   dotnet build
+   ```
+
+### Настройка
+
+1. Скачайте модель Whisper (tiny или base) и поместите в директорию `models/`
+2. Для использования консольного приложения:
+   ```
+   dotnet run --project src/SpeechRecognition.Console
+   ```
 
 ## Использование
 
 ### Консольное приложение
 
-```bash
-# Использование опубликованной версии
-cd publish
-./whisper-stream --file path/to/audio.wav --language ru --model path/to/model.bin --num-chunks 1
+Консольное приложение позволяет быстро протестировать функциональность распознавания речи:
+
 ```
-
-или
-
-```bash
-# Использование версии для разработки
-cd src
-dotnet run --project SpeechRecognition.Console -- --file path/to/audio.wav --language ru --num-chunks 2
+whisper-stream --file <путь_к_файлу> [--language ru] [--model <путь_к_модели>] [--num-chunks 1]
 ```
 
 Параметры:
-- `--file`, `-f` - путь к аудиофайлу для распознавания
-- `--language`, `-l` - язык для распознавания (по умолчанию: ru)
-- `--model`, `-m` - путь к файлу модели Whisper (по умолчанию: models/ggml-tiny.bin)
-- `--num-chunks`, `-n` - количество фрагментов для обработки аудиофайла (по умолчанию: 1)
+- `--file` или `-f`: Путь к аудиофайлу для распознавания
+- `--language` или `-l`: Язык для распознавания (по умолчанию: ru)
+- `--model` или `-m`: Путь к файлу модели Whisper
+- `--num-chunks` или `-n`: Количество фрагментов для обработки
 
-### Использование как библиотеки
+### Интеграция в приложения
+
+Для интеграции в существующие приложения используйте `ISpeechRecognitionService`:
 
 ```csharp
-// Создание процессора с указанием пути к модели и языка
-using var logger = loggerFactory.CreateLogger<MyClass>();
-using var processor = new WhisperStreamProcessor(logger, "path/to/model.bin", "ru");
+using Microsoft.Extensions.Logging;
+using SpeechRecognition.Core;
 
-// Инициализация процессора
+// Создание сервиса распознавания
+var logger = loggerFactory.CreateLogger<Program>();
+var service = SpeechRecognitionServiceFactory.CreateService(
+    logger, 
+    "path/to/model.bin", 
+    "ru", 
+    "tiny"
+);
+
+// Инициализация сервиса
+await service.InitializeAsync();
+
+// Подписка на события
+service.RecognitionCompleted += (sender, e) => {
+    Console.WriteLine($"Распознано: {e.Result.Text}");
+};
+
+// Обработка аудиофайла
+string result = await service.ProcessFileAsync("path/to/audio.wav");
+
+// Обработка аудиофрагмента
+byte[] audioChunk = GetAudioChunk(); // получение аудиоданных
+string fragmentResult = await service.ProcessStreamAsync(audioChunk);
+
+// Использование очереди распознавания
+var (queueItemId, resultTask) = await service.EnqueueRecognitionItemAsync(
+    audioChunk, 
+    priority: 0, 
+    metadata: "fragment1"
+);
+
+// Позже получение результата
+string text = await resultTask;
+
+// Запуск обработки очереди с параллелизмом
+await service.ProcessQueueAsync(maxParallelProcessing: 2);
+```
+
+### Примеры использования
+
+Проверка доступности модели и распознавание аудиофайла:
+
+```csharp
+using SpeechRecognition.Core;
+using Microsoft.Extensions.Logging;
+
+// Создание логгера
+using var loggerFactory = LoggerFactory.Create(builder =>
+{
+    builder.AddConsole();
+    builder.SetMinimumLevel(LogLevel.Information);
+});
+var logger = loggerFactory.CreateLogger<Program>();
+
+// Создание и инициализация процессора
+using var processor = new WhisperStreamProcessor(logger, "models/ggml-tiny.bin", "ru");
 await processor.InitializeAsync();
 
 // Обработка файла
-string result = await processor.ProcessFileAsync("path/to/audio.wav");
-Console.WriteLine(result);
-
-// Обработка файла с разбиением на фрагменты
-int numChunks = 3; // Количество фрагментов
-string resultChunks = await processor.ProcessFileInChunksAsync("path/to/audio.wav", numChunks);
-Console.WriteLine(resultChunks);
-
-// Обработка потока аудиофрагментов
-byte[] audioChunk = GetAudioChunk(); // Получение аудиофрагмента
-string recognizedText = await processor.ProcessStreamAsync(audioChunk);
-Console.WriteLine(recognizedText);
+var result = await processor.ProcessFileAsync("audioExamples/test.wav");
+Console.WriteLine($"Распознанный текст: {result}");
 ```
 
-## Лицензия
+## Расширение функциональности
 
-MIT 
+### Добавление новых моделей распознавания
+
+Система спроектирована для легкого расширения новыми моделями распознавания. Для добавления новой модели необходимо:
+
+1. Создать класс настроек модели, реализующий интерфейс `IModelSettings`
+2. Создать провайдер модели, реализующий интерфейс `IModelProvider`
+3. Создать распознаватель, наследующий от `BaseSpeechRecognizer`
+4. Зарегистрировать новую модель в фабриках
+
+Подробная документация по расширению системы доступна в файле `src/SpeechRecognition.Core/README_EXTENSION.md`.
+
+## Управление сессиями и очередью распознавания
+
+Система предлагает гибкие возможности для управления сессиями распознавания:
+
+- Создание и управление сессиями через `SessionManager`
+- Очередь распознавания с приоритетами
+- Параллельная обработка нескольких фрагментов
+- Возможность отмены, паузы и возобновления обработки
+- Отслеживание статуса обработки через события
+
+Пример управления очередью:
+
+```csharp
+// Постановка фрагментов в очередь с разными приоритетами
+var (id1, task1) = await service.EnqueueRecognitionItemAsync(audioChunk1, priority: 1);
+var (id2, task2) = await service.EnqueueRecognitionItemAsync(audioChunk2, priority: 0); // выше приоритет
+
+// Изменение приоритета
+service.ChangeItemPriority(id1, newPriority: -1); // стал выше приоритет
+
+// Отмена обработки
+service.CancelQueueItem(id2);
+
+// Получение статуса очереди
+var items = service.GetQueueItems();
+var pendingCount = service.GetQueueItemCount(RecognitionQueueItemStatus.Pending);
+
+// Управление очередью
+service.PauseQueue();
+service.ResumeQueue();
+service.ClearQueue();
+```
+
+## Обработка ошибок и восстановление
+
+Система включает механизмы обработки ошибок и восстановления:
+
+- Политики повторных попыток через `RetryPolicy`
+- Логирование ошибок с подробной диагностикой
+- Восстановление после временных сбоев
+- Корректное освобождение ресурсов
+
+Пример настройки политики повторов:
+
+```csharp
+var retryPolicy = RetryPolicyFactory.CreateExponentialBackoff(
+    maxRetryCount: 3,
+    initialDelay: TimeSpan.FromSeconds(1),
+    maxDelay: TimeSpan.FromSeconds(5)
+);
+
+var service = SpeechRecognitionServiceFactory.CreateServiceWithRetryPolicy(
+    logger,
+    modelPath,
+    language: "ru",
+    modelType: "tiny",
+    retryPolicy: retryPolicy
+);
+```
+
+## Тестирование
+
+Проект включает набор тестов для проверки функциональности:
+
+- Модульные тесты компонентов
+- Интеграционные тесты
+- Тесты восстановления после ошибок
+- Тесты производительности
+
+Для запуска тестов используйте:
+
+```
+dotnet test
+```

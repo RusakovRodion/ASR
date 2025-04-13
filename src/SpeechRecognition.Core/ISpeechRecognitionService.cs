@@ -10,7 +10,7 @@ namespace SpeechRecognition.Core
     /// <summary>
     /// Интерфейс сервиса распознавания речи для внешних приложений
     /// </summary>
-    public interface ISpeechRecognitionService : IDisposable
+    public interface ISpeechRecognitionService : IDisposable, IAsyncDisposable
     {
         /// <summary>
         /// Событие, возникающее при получении результата распознавания речи
@@ -26,6 +26,11 @@ namespace SpeechRecognition.Core
         /// Событие изменения статуса элемента очереди
         /// </summary>
         event EventHandler<FragmentStatusChangedEventArgs> QueueItemStatusChanged;
+        
+        /// <summary>
+        /// Событие изменения состояния очереди (активна/приостановлена)
+        /// </summary>
+        event EventHandler<QueueStateChangedEventArgs> QueueStateChanged;
 
         /// <summary>
         /// Инициализирует сервис распознавания речи
@@ -66,8 +71,13 @@ namespace SpeechRecognition.Core
         /// <param name="audioChunk">Аудиоданные фрагмента</param>
         /// <param name="priority">Приоритет (меньшее значение - более высокий приоритет)</param>
         /// <param name="metadata">Пользовательские метаданные</param>
-        /// <returns>Идентификатор элемента очереди</returns>
-        Guid EnqueueRecognitionItem(byte[] audioChunk, int priority = 0, string metadata = "");
+        /// <param name="processImmediately">Обработать немедленно, минуя очередь</param>
+        /// <returns>Идентификатор элемента очереди и задача для отслеживания результата</returns>
+        Task<(Guid QueueItemId, Task<string> ResultTask)> EnqueueRecognitionItemAsync(
+            byte[] audioChunk, 
+            int priority = 0, 
+            string metadata = "", 
+            bool processImmediately = false);
 
         /// <summary>
         /// Изменяет приоритет фрагмента в очереди
@@ -89,14 +99,14 @@ namespace SpeechRecognition.Core
         /// </summary>
         /// <param name="itemId">Идентификатор элемента очереди</param>
         /// <returns>Информация о фрагменте или null, если не найден</returns>
-        object GetQueueItem(Guid itemId);
+        QueueItem GetQueueItem(Guid itemId);
 
         /// <summary>
         /// Получает список элементов очереди
         /// </summary>
         /// <param name="statusFilter">Фильтр по статусу (null для всех элементов)</param>
         /// <returns>Список элементов очереди</returns>
-        IReadOnlyList<object> GetQueueItems(RecognitionQueueItemStatus? statusFilter = null);
+        IReadOnlyList<QueueItem> GetQueueItems(RecognitionQueueItemStatus? statusFilter = null);
 
         /// <summary>
         /// Приостанавливает обработку очереди
@@ -115,6 +125,11 @@ namespace SpeechRecognition.Core
         void ClearQueue(bool cancelProcessing = false);
 
         /// <summary>
+        /// Отменяет все операции распознавания
+        /// </summary>
+        void CancelAllOperations();
+
+        /// <summary>
         /// Удаляет элемент из очереди
         /// </summary>
         /// <param name="itemId">Идентификатор элемента очереди</param>
@@ -127,5 +142,99 @@ namespace SpeechRecognition.Core
         /// <param name="status">Статус (null для всех элементов)</param>
         /// <returns>Количество элементов</returns>
         int GetQueueItemCount(RecognitionQueueItemStatus? status = null);
+        
+        /// <summary>
+        /// Запускает обработку очереди с указанным уровнем параллелизма
+        /// </summary>
+        /// <param name="maxParallelProcessing">Максимальное количество одновременно обрабатываемых фрагментов</param>
+        /// <param name="cancellationToken">Токен отмены операции</param>
+        /// <returns>Задача, представляющая асинхронную операцию</returns>
+        Task ProcessQueueAsync(int maxParallelProcessing = 1, CancellationToken cancellationToken = default);
+    }
+    
+    /// <summary>
+    /// Статус элемента очереди распознавания
+    /// </summary>
+    public enum RecognitionQueueItemStatus
+    {
+        /// <summary>
+        /// Ожидает обработки
+        /// </summary>
+        Pending,
+
+        /// <summary>
+        /// Находится в процессе обработки
+        /// </summary>
+        Processing,
+
+        /// <summary>
+        /// Обработка завершена успешно
+        /// </summary>
+        Completed,
+
+        /// <summary>
+        /// Обработка завершена с ошибкой
+        /// </summary>
+        Failed,
+
+        /// <summary>
+        /// Обработка отменена
+        /// </summary>
+        Canceled
+    }
+    
+    /// <summary>
+    /// Информация об элементе очереди распознавания
+    /// </summary>
+    public class QueueItem
+    {
+        /// <summary>
+        /// Идентификатор элемента
+        /// </summary>
+        public Guid Id { get; }
+        
+        /// <summary>
+        /// Статус элемента
+        /// </summary>
+        public RecognitionQueueItemStatus Status { get; }
+        
+        /// <summary>
+        /// Приоритет обработки (меньшее значение - более высокий приоритет)
+        /// </summary>
+        public int Priority { get; }
+        
+        /// <summary>
+        /// Время добавления в очередь
+        /// </summary>
+        public DateTime EnqueueTime { get; }
+        
+        /// <summary>
+        /// Пользовательские метаданные
+        /// </summary>
+        public string Metadata { get; }
+        
+        /// <summary>
+        /// Размер аудиоданных в байтах
+        /// </summary>
+        public int AudioDataSize { get; }
+        
+        /// <summary>
+        /// Создает информацию об элементе очереди
+        /// </summary>
+        public QueueItem(
+            Guid id, 
+            RecognitionQueueItemStatus status, 
+            int priority, 
+            DateTime enqueueTime, 
+            string metadata, 
+            int audioDataSize)
+        {
+            Id = id;
+            Status = status;
+            Priority = priority;
+            EnqueueTime = enqueueTime;
+            Metadata = metadata;
+            AudioDataSize = audioDataSize;
+        }
     }
 } 

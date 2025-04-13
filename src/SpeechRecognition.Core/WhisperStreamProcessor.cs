@@ -13,23 +13,25 @@ using SpeechRecognition.Core.Events;
 using System.Text.RegularExpressions;
 using System.Linq;
 using NAudio.Wave;
+using SpeechRecognition.Core.Recovery;
 
 namespace SpeechRecognition.Core
 {
     /// <summary>
     /// Класс для потокового распознавания речи
     /// </summary>
-    public class WhisperStreamProcessor : ISpeechRecognitionService, IDisposable
+    public class WhisperStreamProcessor : ISpeechRecognitionService, IDisposable, IAsyncDisposable
     {
         private readonly ILogger _logger;
         private readonly IAudioProcessor _audioProcessor;
         private readonly ISpeechRecognizer _recognizer;
-        private readonly SessionManager _sessionManager;
+        private readonly Sessions.SessionManager _sessionManager;
         private readonly ModelDownloader _modelDownloader;
         private RecognitionSession _currentSession;
         private bool _isDisposed;
         private readonly string _language;
         private int numChunksUsed = 1;
+        private readonly CancellationTokenSource _disposalCts = new CancellationTokenSource();
 
         /// <summary>
         /// Событие, возникающее при получении результата распознавания речи
@@ -45,6 +47,44 @@ namespace SpeechRecognition.Core
         /// Событие изменения статуса элемента очереди
         /// </summary>
         public event EventHandler<FragmentStatusChangedEventArgs> QueueItemStatusChanged;
+        
+        /// <summary>
+        /// Событие изменения состояния очереди
+        /// </summary>
+        public event EventHandler<QueueStateChangedEventArgs> QueueStateChanged;
+
+        /// <summary>
+        /// Событие, возникающее при ошибке распознавания
+        /// </summary>
+        public event EventHandler<RecognitionErrorEventArgs> RecognitionError;
+
+        /// <summary>
+        /// Создает новый экземпляр класса WhisperStreamProcessor с указанным распознавателем
+        /// </summary>
+        /// <param name="logger">Логгер</param>
+        /// <param name="recognizer">Распознаватель речи</param>
+        public WhisperStreamProcessor(ILogger logger, ISpeechRecognizer recognizer)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _recognizer = recognizer ?? throw new ArgumentNullException(nameof(recognizer));
+            
+            _audioProcessor = new AudioProcessor();
+            _modelDownloader = new ModelDownloader(logger);
+            _sessionManager = new Sessions.SessionManager(_recognizer, logger);
+            _isDisposed = false;
+            _language = recognizer.ModelSettings?.Language ?? "ru";
+
+            // Создаем сессию для обработки потока
+            _currentSession = _sessionManager.CreateSession();
+            
+            // Подписываемся на события SessionManager
+            _sessionManager.RecognitionStarted += OnSessionManagerRecognitionStarted;
+            _sessionManager.RecognitionCompleted += OnSessionManagerRecognitionCompleted;
+            _sessionManager.FragmentStatusChanged += OnSessionManagerFragmentStatusChanged;
+            _sessionManager.QueueStateChanged += OnSessionManagerQueueStateChanged;
+            
+            _logger.LogInformation($"WhisperStreamProcessor создан с моделью: {recognizer.ModelSettings?.ModelPath ?? "не указана"}, тип: {recognizer.RecognizerType}, язык: {_language}");
+        }
 
         /// <summary>
         /// Создает новый экземпляр класса WhisperStreamProcessor
@@ -64,8 +104,9 @@ namespace SpeechRecognition.Core
 
             _modelDownloader = new ModelDownloader(logger);
             _audioProcessor = new AudioProcessor();
-            _recognizer = new WhisperRecognizer(_audioProcessor, modelPath, language);
-            _sessionManager = new SessionManager(_recognizer);
+            var modelSettings = new WhisperModelSettings(modelPath, language, modelType);
+            _recognizer = new WhisperRecognizer(_audioProcessor, modelSettings, logger);
+            _sessionManager = new Sessions.SessionManager(_recognizer, logger);
             _isDisposed = false;
             _language = language;
 
@@ -76,6 +117,7 @@ namespace SpeechRecognition.Core
             _sessionManager.RecognitionStarted += OnSessionManagerRecognitionStarted;
             _sessionManager.RecognitionCompleted += OnSessionManagerRecognitionCompleted;
             _sessionManager.FragmentStatusChanged += OnSessionManagerFragmentStatusChanged;
+            _sessionManager.QueueStateChanged += OnSessionManagerQueueStateChanged;
             
             _logger.LogInformation($"WhisperStreamProcessor создан с моделью: {modelPath}, язык: {language}");
         }
@@ -97,6 +139,14 @@ namespace SpeechRecognition.Core
         }
 
         /// <summary>
+        /// Обработчик события изменения состояния очереди
+        /// </summary>
+        private void OnSessionManagerQueueStateChanged(object sender, QueueStateChangedEventArgs e)
+        {
+            QueueStateChanged?.Invoke(this, e);
+        }
+
+        /// <summary>
         /// Инициализирует процессор
         /// </summary>
         /// <returns>Task, представляющий асинхронную операцию инициализации</returns>
@@ -106,13 +156,19 @@ namespace SpeechRecognition.Core
 
             try
             {
-                // Проверяем наличие модели и скачиваем её при необходимости
-                string modelPath = await _modelDownloader.EnsureModelExistsAsync(
-                    ((WhisperRecognizer)_recognizer).ModelPath,
-                    Path.GetFileNameWithoutExtension(((WhisperRecognizer)_recognizer).ModelPath).Contains("tiny") ? "tiny" : "base");
+                // Получаем провайдер моделей и проверяем наличие модели
+                var modelProvider = ModelProviderFactory.CreateProvider(_recognizer.ModelSettings, _logger);
+                await modelProvider.EnsureModelExistsAsync(_recognizer.ModelSettings);
                 
                 // Инициализация распознавателя
                 await _recognizer.InitializeAsync();
+                
+                // Создаем новую сессию, если она еще не создана
+                if (_currentSession == null)
+                {
+                    _currentSession = _sessionManager.CreateSession();
+                    _logger.LogDebug($"Создана новая сессия с ID: {_currentSession.Id}");
+                }
                 
                 _logger.LogInformation("WhisperStreamProcessor успешно инициализирован");
             }
@@ -136,11 +192,27 @@ namespace SpeechRecognition.Core
             if (audioChunk == null || audioChunk.Length == 0)
             {
                 _logger.LogWarning("Получен пустой аудиофрагмент");
-                return string.Empty;
+                throw new ArgumentException("Аудиофрагмент не может быть пустым или null");
+            }
+
+            // Проверяем, что сессия инициализирована
+            if (_currentSession == null)
+            {
+                _logger.LogDebug("Текущая сессия не инициализирована, создаем новую");
+                _currentSession = _sessionManager.CreateSession();
             }
 
             try
             {
+                // Проверяем, что аудио в WAV формате
+                if (!_audioProcessor.IsWavFile(audioChunk))
+                {
+                    _logger.LogWarning("Аудиоданные не в формате WAV");
+                    var ex = new InvalidOperationException("Аудиоданные должны быть в формате WAV");
+                    RecognitionError?.Invoke(this, new Events.RecognitionErrorEventArgs(ex, "Неверный формат аудио"));
+                    throw ex;
+                }
+
                 _logger.LogDebug($"Обработка аудиофрагмента размером {audioChunk.Length} байт");
                 var result = await _sessionManager.ProcessFragmentAsync(_currentSession.Id, audioChunk, cancellationToken);
                 
@@ -152,17 +224,20 @@ namespace SpeechRecognition.Core
                 else
                 {
                     _logger.LogWarning("Не удалось получить результат распознавания");
-                    return string.Empty;
+                    var ex = new InvalidOperationException("Не удалось получить результат распознавания");
+                    RecognitionError?.Invoke(this, new Events.RecognitionErrorEventArgs(ex, "Пустой результат распознавания"));
+                    throw ex;
                 }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException ex)
             {
                 _logger.LogInformation("Операция распознавания была отменена");
                 throw;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Ошибка при обработке аудиофрагмента");
+                _logger.LogError(ex, "Ошибка при распознавании аудиофрагмента");
+                RecognitionError?.Invoke(this, new Events.RecognitionErrorEventArgs(ex, "Ошибка при распознавании аудиофрагмента"));
                 throw;
             }
         }
@@ -272,17 +347,19 @@ namespace SpeechRecognition.Core
                         try
                         {
                             // Создаем новый распознаватель для этой сессии
-                            var recognizer = new WhisperRecognizer(_audioProcessor, ((WhisperRecognizer)_recognizer).ModelPath, _language);
+                            var modelSettings = _recognizer.ModelSettings;
+                            var recognizer = SpeechRecognizerFactory.CreateRecognizer(_audioProcessor, modelSettings, _logger);
                             await recognizer.InitializeAsync();
                             
                             // Создаем новую сессию
-                            using var session = new RecognitionSession(recognizer);
+                            using var session = new RecognitionSession(recognizer, _logger);
                             
                             _logger.LogInformation($"Начало распознавания фрагмента #{fragmentIndex + 1} в сессии {session.Id}");
                             
                             // Распознаем речь
                             DateTime startTime = DateTime.Now;
-                            var result = await session.ProcessFragmentAsync(wavChunks[fragmentIndex], cancellationToken);
+                            int fragmentId = await session.AddFragmentAsync(wavChunks[fragmentIndex]);
+                            var result = await session.ProcessFragmentAsync(fragmentId, cancellationToken);
                             DateTime endTime = DateTime.Now;
                             
                             // Определяем примерную длительность аудиофрагмента в секундах
@@ -534,41 +611,68 @@ namespace SpeechRecognition.Core
             return result;
         }
 
-        #region Методы управления очередью распознавания
-
+        #region Методы управления очередью
+        
         /// <summary>
         /// Добавляет фрагмент в очередь распознавания
         /// </summary>
         /// <param name="audioChunk">Аудиоданные фрагмента</param>
         /// <param name="priority">Приоритет (меньшее значение - более высокий приоритет)</param>
         /// <param name="metadata">Пользовательские метаданные</param>
-        /// <returns>Идентификатор элемента очереди</returns>
-        public Guid EnqueueRecognitionItem(byte[] audioChunk, int priority = 0, string metadata = "")
+        /// <param name="processImmediately">Обработать немедленно, минуя очередь</param>
+        /// <returns>Идентификатор элемента очереди и задача для отслеживания результата</returns>
+        public async Task<(Guid QueueItemId, Task<string> ResultTask)> EnqueueRecognitionItemAsync(
+            byte[] audioChunk, 
+            int priority = 0, 
+            string metadata = "", 
+            bool processImmediately = false)
         {
             ThrowIfDisposed();
             
-            // Проверяем аудиоданные
             if (audioChunk == null || audioChunk.Length == 0)
             {
                 throw new ArgumentException("Аудиоданные не могут быть пустыми", nameof(audioChunk));
             }
             
-            // Подготавливаем аудиоданные, если нужно
-            if (!_audioProcessor.IsWavFile(audioChunk))
+            try
             {
-                _logger.LogInformation("Добавление WAV-заголовка к данным перед постановкой в очередь");
-                audioChunk = _audioProcessor.AddWavHeader(audioChunk);
+                // Подготавливаем аудиоданные для распознавания
+                byte[] preparedAudio = await _audioProcessor.PrepareAudioDataAsync(audioChunk);
+                
+                // Добавляем фрагмент в очередь
+                var (fragmentId, processingTask) = await _sessionManager.EnqueueFragmentAsync(
+                    preparedAudio, priority, metadata, _currentSession.Id, processImmediately);
+                
+                // Создаем глобальный идентификатор для элемента очереди
+                var queueItemId = _sessionManager.GetFragmentGlobalId(_currentSession.Id, fragmentId);
+                
+                // Преобразуем результат распознавания в текст
+                var resultTask = processingTask.ContinueWith(t => 
+                {
+                    if (t.IsFaulted)
+                    {
+                        _logger.LogError(t.Exception, "Ошибка при обработке фрагмента {FragmentId}", fragmentId);
+                        return string.Empty;
+                    }
+                    
+                    if (t.IsCanceled)
+                    {
+                        return string.Empty;
+                    }
+                    
+                    var result = t.Result;
+                    return result?.Text ?? string.Empty;
+                }, TaskContinuationOptions.ExecuteSynchronously);
+                
+                return (queueItemId, resultTask);
             }
-            
-            // Добавляем фрагмент в очередь через SessionManager
-            var fragmentIdTask = _sessionManager.EnqueueFragmentAsync(audioChunk, priority, metadata);
-            int fragmentId = fragmentIdTask.GetAwaiter().GetResult();
-            
-            // Формируем уникальный GUID на основе идентификатора сессии и фрагмента
-            // для совместимости с интерфейсом
-            return GetExternalQueueId(fragmentId);
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при добавлении фрагмента в очередь распознавания");
+                throw;
+            }
         }
-
+        
         /// <summary>
         /// Изменяет приоритет фрагмента в очереди
         /// </summary>
@@ -579,12 +683,17 @@ namespace SpeechRecognition.Core
         {
             ThrowIfDisposed();
             
-            // Преобразуем внешний идентификатор в идентификатор фрагмента
-            int fragmentId = GetInternalFragmentId(itemId);
-            
-            return _sessionManager.ChangeFragmentPriority(fragmentId, newPriority);
+            try
+            {
+                return _sessionManager.ChangeFragmentPriority(itemId, newPriority);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при изменении приоритета фрагмента {ItemId}", itemId);
+                return false;
+            }
         }
-
+        
         /// <summary>
         /// Отменяет обработку фрагмента
         /// </summary>
@@ -594,87 +703,125 @@ namespace SpeechRecognition.Core
         {
             ThrowIfDisposed();
             
-            // Преобразуем внешний идентификатор в идентификатор фрагмента
-            int fragmentId = GetInternalFragmentId(itemId);
-            
-            return _sessionManager.CancelFragment(fragmentId);
+            try
+            {
+                return _sessionManager.CancelFragment(itemId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при отмене обработки фрагмента {ItemId}", itemId);
+                return false;
+            }
         }
-
+        
         /// <summary>
         /// Получает информацию о фрагменте в очереди
         /// </summary>
         /// <param name="itemId">Идентификатор элемента очереди</param>
         /// <returns>Информация о фрагменте или null, если не найден</returns>
-        public object GetQueueItem(Guid itemId)
+        public QueueItem GetQueueItem(Guid itemId)
         {
             ThrowIfDisposed();
             
-            // Преобразуем внешний идентификатор в идентификатор фрагмента
-            int fragmentId = GetInternalFragmentId(itemId);
-            
-            // Получаем информацию о фрагменте
-            var fragment = _sessionManager.GetFragment(fragmentId);
-            
-            if (fragment == null)
-                return null;
+            try
+            {
+                var fragment = _sessionManager.GetFragmentInfo(itemId);
                 
-            // Преобразуем SessionFragment в RecognitionQueueItem для совместимости с интерфейсом
-            return new RecognitionQueueItem(
-                fragment.FragmentId, 
-                fragment.AudioData, 
-                ConvertFragmentStatus(fragment.Status),
-                fragment.Priority,
-                fragment.Metadata,
-                fragment.AddedTime,
-                GetExternalQueueId(fragment.FragmentId));
+                if (fragment == null)
+                {
+                    return null;
+                }
+                
+                return new QueueItem(
+                    itemId,
+                    ConvertFragmentStatus(fragment.Status),
+                    fragment.Priority,
+                    fragment.AddedTime,
+                    fragment.Metadata,
+                    fragment.AudioData?.Length ?? 0
+                );
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при получении информации о фрагменте {ItemId}", itemId);
+                return null;
+            }
         }
-
+        
         /// <summary>
         /// Получает список элементов очереди
         /// </summary>
         /// <param name="statusFilter">Фильтр по статусу (null для всех элементов)</param>
         /// <returns>Список элементов очереди</returns>
-        public IReadOnlyList<object> GetQueueItems(RecognitionQueueItemStatus? statusFilter = null)
+        public IReadOnlyList<QueueItem> GetQueueItems(RecognitionQueueItemStatus? statusFilter = null)
         {
             ThrowIfDisposed();
             
-            // Преобразуем внешний статус во внутренний
-            FragmentStatus? fragmentStatus = statusFilter.HasValue ? 
-                ConvertQueueItemStatus(statusFilter.Value) : null;
+            try
+            {
+                // Преобразуем фильтр статуса
+                FragmentStatus? fragmentStatus = statusFilter.HasValue ?
+                    ConvertQueueItemStatus(statusFilter.Value) : null;
                 
-            // Получаем список фрагментов
-            var fragments = _sessionManager.GetFragments(fragmentStatus);
-            
-            // Преобразуем список фрагментов в список RecognitionQueueItem и приводим к object
-            return fragments.Select(f => (object)new RecognitionQueueItem(
-                f.FragmentId,
-                f.AudioData,
-                ConvertFragmentStatus(f.Status),
-                f.Priority,
-                f.Metadata,
-                f.AddedTime,
-                GetExternalQueueId(f.FragmentId)
-            )).ToList();
+                // Получаем фрагменты из менеджера сессий, указывая ID текущей сессии
+                var fragments = _sessionManager.GetFragments(fragmentStatus, _currentSession.Id);
+                
+                // Преобразуем фрагменты в элементы очереди
+                return fragments.Select(fragment => 
+                {
+                    var queueItemId = _sessionManager.GetFragmentGlobalId(_currentSession.Id, fragment.FragmentId);
+                    
+                    return new QueueItem(
+                        queueItemId,
+                        ConvertFragmentStatus(fragment.Status),
+                        fragment.Priority,
+                        fragment.AddedTime,
+                        fragment.Metadata,
+                        fragment.AudioData?.Length ?? 0
+                    );
+                }).ToList();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при получении списка элементов очереди");
+                return Array.Empty<QueueItem>();
+            }
         }
-
+        
         /// <summary>
         /// Приостанавливает обработку очереди
         /// </summary>
         public void PauseQueue()
         {
             ThrowIfDisposed();
-            _sessionManager.PauseProcessing();
+            
+            try
+            {
+                _sessionManager.PauseProcessing();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при приостановке обработки очереди");
+            }
         }
-
+        
         /// <summary>
         /// Возобновляет обработку очереди
         /// </summary>
         public void ResumeQueue()
         {
             ThrowIfDisposed();
-            _sessionManager.ResumeProcessing();
+            
+            try
+            {
+                _sessionManager.ResumeProcessing();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при возобновлении обработки очереди");
+            }
         }
-
+        
         /// <summary>
         /// Очищает очередь распознавания
         /// </summary>
@@ -683,20 +830,33 @@ namespace SpeechRecognition.Core
         {
             ThrowIfDisposed();
             
-            if (cancelProcessing) 
+            try
             {
-                // Если нужно отменить текущие операции, отменяем все фрагменты со статусом Processing
-                var processingFragments = _sessionManager.GetFragments(FragmentStatus.Processing);
-                foreach (var fragment in processingFragments)
-                {
-                    _sessionManager.CancelFragment(fragment.FragmentId);
-                }
+                _sessionManager.ClearQueue(null, cancelProcessing);
             }
-            
-            // Очищаем очередь ожидающих фрагментов
-            _sessionManager.ClearPendingFragments();
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при очистке очереди распознавания");
+            }
         }
-
+        
+        /// <summary>
+        /// Отменяет все операции распознавания
+        /// </summary>
+        public void CancelAllOperations()
+        {
+            ThrowIfDisposed();
+            
+            try
+            {
+                _sessionManager.CancelAllOperations();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при отмене всех операций распознавания");
+            }
+        }
+        
         /// <summary>
         /// Удаляет элемент из очереди
         /// </summary>
@@ -706,12 +866,17 @@ namespace SpeechRecognition.Core
         {
             ThrowIfDisposed();
             
-            // Преобразуем внешний идентификатор в идентификатор фрагмента
-            int fragmentId = GetInternalFragmentId(itemId);
-            
-            return _sessionManager.CancelFragment(fragmentId);
+            try
+            {
+                return _sessionManager.CancelFragment(itemId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при удалении элемента из очереди {ItemId}", itemId);
+                return false;
+            }
         }
-
+        
         /// <summary>
         /// Возвращает количество элементов в очереди с указанным статусом
         /// </summary>
@@ -721,67 +886,69 @@ namespace SpeechRecognition.Core
         {
             ThrowIfDisposed();
             
-            // Преобразуем внешний статус во внутренний
-            FragmentStatus? fragmentStatus = status.HasValue ? 
-                ConvertQueueItemStatus(status.Value) : null;
-                
-            return _sessionManager.GetFragmentsCount(fragmentStatus);
-        }
-        
-        // Вспомогательный класс для совместимости с интерфейсом
-        public class RecognitionQueueItem
-        {
-            public int InternalId { get; }
-            public byte[] AudioData { get; }
-            public RecognitionQueueItemStatus Status { get; }
-            public int Priority { get; }
-            public string Metadata { get; }
-            public DateTime EnqueueTime { get; }
-            public Guid Id { get; }
-            
-            public RecognitionQueueItem(
-                int internalId, 
-                byte[] audioData, 
-                RecognitionQueueItemStatus status, 
-                int priority, 
-                string metadata, 
-                DateTime enqueueTime,
-                Guid id)
+            try
             {
-                InternalId = internalId;
-                AudioData = audioData;
-                Status = status;
-                Priority = priority;
-                Metadata = metadata;
-                EnqueueTime = enqueueTime;
-                Id = id;
+                // Преобразуем фильтр статуса
+                FragmentStatus? fragmentStatus = status.HasValue ?
+                    ConvertQueueItemStatus(status.Value) : null;
+                
+                return _sessionManager.GetFragmentsCount(fragmentStatus, _currentSession.Id);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при получении количества элементов в очереди");
+                return 0;
             }
         }
         
-        // Вспомогательные методы преобразования
-        private Guid GetExternalQueueId(int fragmentId)
+        /// <summary>
+        /// Запускает обработку очереди с указанным уровнем параллелизма
+        /// </summary>
+        /// <param name="maxParallelProcessing">Максимальное количество одновременно обрабатываемых фрагментов</param>
+        /// <param name="cancellationToken">Токен отмены операции</param>
+        /// <returns>Задача, представляющая асинхронную операцию</returns>
+        public async Task ProcessQueueAsync(int maxParallelProcessing = 1, CancellationToken cancellationToken = default)
         {
-            // Упрощенная реализация: используем идентификатор фрагмента как последние 4 байта GUID
-            return new Guid(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, (byte)fragmentId);
+            ThrowIfDisposed();
+            
+            // Комбинируем токены отмены
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken, 
+                _disposalCts.Token);
+            
+            try
+            {
+                await _currentSession.ProcessQueueAsync(maxParallelProcessing, linkedCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                // Нормальная отмена, просто возвращаемся
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при обработке очереди распознавания");
+                throw;
+            }
         }
         
-        private int GetInternalFragmentId(Guid itemId)
-        {
-            // Получаем идентификатор фрагмента из последнего байта GUID
-            byte[] bytes = itemId.ToByteArray();
-            return bytes[15];
-        }
-        
+        // Вспомогательные методы для преобразования статусов
         private RecognitionQueueItemStatus ConvertFragmentStatus(FragmentStatus status)
         {
             switch (status)
             {
-                case FragmentStatus.Pending: return RecognitionQueueItemStatus.Pending;
-                case FragmentStatus.Processing: return RecognitionQueueItemStatus.Processing;
-                case FragmentStatus.Completed: return RecognitionQueueItemStatus.Completed;
-                case FragmentStatus.Failed: return RecognitionQueueItemStatus.Failed;
-                case FragmentStatus.Canceled: return RecognitionQueueItemStatus.Canceled;
-                default: return RecognitionQueueItemStatus.Pending;
+                case FragmentStatus.Pending:
+                    return RecognitionQueueItemStatus.Pending;
+                case FragmentStatus.Processing:
+                    return RecognitionQueueItemStatus.Processing;
+                case FragmentStatus.Completed:
+                    return RecognitionQueueItemStatus.Completed;
+                case FragmentStatus.Failed:
+                    return RecognitionQueueItemStatus.Failed;
+                case FragmentStatus.Canceled:
+                    return RecognitionQueueItemStatus.Canceled;
+                default:
+                    return RecognitionQueueItemStatus.Pending;
             }
         }
         
@@ -789,16 +956,161 @@ namespace SpeechRecognition.Core
         {
             switch (status)
             {
-                case RecognitionQueueItemStatus.Pending: return FragmentStatus.Pending;
-                case RecognitionQueueItemStatus.Processing: return FragmentStatus.Processing;
-                case RecognitionQueueItemStatus.Completed: return FragmentStatus.Completed;
-                case RecognitionQueueItemStatus.Failed: return FragmentStatus.Failed;
-                case RecognitionQueueItemStatus.Canceled: return FragmentStatus.Canceled;
-                default: return FragmentStatus.Pending;
+                case RecognitionQueueItemStatus.Pending:
+                    return FragmentStatus.Pending;
+                case RecognitionQueueItemStatus.Processing:
+                    return FragmentStatus.Processing;
+                case RecognitionQueueItemStatus.Completed:
+                    return FragmentStatus.Completed;
+                case RecognitionQueueItemStatus.Failed:
+                    return FragmentStatus.Failed;
+                case RecognitionQueueItemStatus.Canceled:
+                    return FragmentStatus.Canceled;
+                default:
+                    return FragmentStatus.Pending;
+            }
+        }
+        
+        #endregion
+        
+        /// <summary>
+        /// Повторно обрабатывает фрагмент, завершившийся с ошибкой
+        /// </summary>
+        /// <param name="itemId">Идентификатор элемента очереди</param>
+        /// <returns>true, если фрагмент поставлен на повторную обработку, иначе false</returns>
+        public bool RetryFailedQueueItem(Guid itemId)
+        {
+            ThrowIfDisposed();
+            
+            try
+            {
+                return _sessionManager.RetryFailedFragment(itemId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при повторной обработке фрагмента {ItemId}", itemId);
+                return false;
+            }
+        }
+        
+        /// <summary>
+        /// Повторно обрабатывает все фрагменты, завершившиеся с ошибкой
+        /// </summary>
+        /// <returns>Количество фрагментов, поставленных на повторную обработку</returns>
+        public int RetryAllFailedQueueItems()
+        {
+            ThrowIfDisposed();
+            
+            try
+            {
+                return _sessionManager.RetryAllFailedFragments(_currentSession.Id);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при повторной обработке всех фрагментов с ошибками");
+                return 0;
+            }
+        }
+        
+        /// <summary>
+        /// Получает статистику по обработке фрагментов
+        /// </summary>
+        /// <returns>Словарь со статистикой по каждому статусу</returns>
+        public Dictionary<RecognitionQueueItemStatus, int> GetQueueStatistics()
+        {
+            ThrowIfDisposed();
+            
+            try
+            {
+                var stats = _sessionManager.GetFragmentsStatistics(_currentSession.Id);
+                
+                // Преобразуем статусы из FragmentStatus в RecognitionQueueItemStatus
+                var result = new Dictionary<RecognitionQueueItemStatus, int>();
+                foreach (var pair in stats)
+                {
+                    result[ConvertFragmentStatus(pair.Key)] = pair.Value;
+                }
+                
+                return result;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при получении статистики очереди");
+                return new Dictionary<RecognitionQueueItemStatus, int>();
+            }
+        }
+        
+        /// <summary>
+        /// Настраивает политику восстановления после сбоев
+        /// </summary>
+        /// <param name="maxRetryCount">Максимальное количество повторных попыток</param>
+        /// <param name="retryDelayMs">Базовая задержка перед повтором (в миллисекундах)</param>
+        /// <param name="backoffMultiplier">Множитель для экспоненциального увеличения задержки</param>
+        public void ConfigureRetryPolicy(int maxRetryCount = 3, int retryDelayMs = 1000, double backoffMultiplier = 1.5)
+        {
+            ThrowIfDisposed();
+            
+            try
+            {
+                var options = new RetryPolicyOptions
+                {
+                    MaxRetryCount = maxRetryCount,
+                    RetryDelayMs = retryDelayMs,
+                    BackoffMultiplier = backoffMultiplier
+                };
+                
+                // Создаем и применяем новую политику восстановления
+                RetryPolicy retryPolicy = RetryPolicyFactory.Create(_logger, options);
+                
+                _logger.LogInformation($"Настроена политика восстановления: максимум попыток = {maxRetryCount}, " +
+                                      $"задержка = {retryDelayMs}мс, множитель = {backoffMultiplier}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при настройке политики восстановления");
+                throw;
             }
         }
 
-        #endregion
+        /// <summary>
+        /// Асинхронно освобождает ресурсы
+        /// </summary>
+        public async ValueTask DisposeAsync()
+        {
+            if (_isDisposed)
+            {
+                return;
+            }
+
+            try
+            {
+                // Отменяем все текущие операции
+                _disposalCts.Cancel();
+                
+                // Даем небольшую задержку для завершения операций
+                await Task.Delay(500);
+                
+                // Освобождаем ресурсы асинхронно
+                if (_sessionManager is IAsyncDisposable asyncDisposable)
+                {
+                    await asyncDisposable.DisposeAsync();
+                }
+                else
+                {
+                    _sessionManager.Dispose();
+                }
+                
+                _recognizer.Dispose();
+                _disposalCts.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при асинхронном освобождении ресурсов");
+            }
+
+            _isDisposed = true;
+            GC.SuppressFinalize(this);
+        }
 
         /// <summary>
         /// Освобождает ресурсы
@@ -810,14 +1122,26 @@ namespace SpeechRecognition.Core
                 return;
             }
 
-            // Отписываемся от событий
-            _sessionManager.RecognitionStarted -= OnSessionManagerRecognitionStarted;
-            _sessionManager.RecognitionCompleted -= OnSessionManagerRecognitionCompleted;
-            _sessionManager.FragmentStatusChanged -= OnSessionManagerFragmentStatusChanged;
+            try
+            {
+                // Отменяем все текущие операции
+                _disposalCts.Cancel();
+                
+                // Отписываемся от событий
+                _sessionManager.RecognitionStarted -= OnSessionManagerRecognitionStarted;
+                _sessionManager.RecognitionCompleted -= OnSessionManagerRecognitionCompleted;
+                _sessionManager.FragmentStatusChanged -= OnSessionManagerFragmentStatusChanged;
+                _sessionManager.QueueStateChanged -= OnSessionManagerQueueStateChanged;
 
-            // Освобождаем ресурсы
-            _sessionManager.Dispose();
-            _recognizer.Dispose();
+                // Освобождаем ресурсы
+                _sessionManager.Dispose();
+                _recognizer.Dispose();
+                _disposalCts.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка при освобождении ресурсов");
+            }
 
             _isDisposed = true;
             GC.SuppressFinalize(this);
@@ -830,36 +1154,5 @@ namespace SpeechRecognition.Core
                 throw new ObjectDisposedException(nameof(WhisperStreamProcessor));
             }
         }
-    }
-    
-    /// <summary>
-    /// Статус элемента очереди распознавания для внешнего интерфейса
-    /// </summary>
-    public enum RecognitionQueueItemStatus
-    {
-        /// <summary>
-        /// Ожидает обработки
-        /// </summary>
-        Pending,
-
-        /// <summary>
-        /// Находится в процессе обработки
-        /// </summary>
-        Processing,
-
-        /// <summary>
-        /// Обработка завершена успешно
-        /// </summary>
-        Completed,
-
-        /// <summary>
-        /// Обработка завершена с ошибкой
-        /// </summary>
-        Failed,
-
-        /// <summary>
-        /// Обработка отменена
-        /// </summary>
-        Canceled
     }
 } 

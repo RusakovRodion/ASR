@@ -49,31 +49,57 @@ namespace SpeechRecognition.Core.Audio
                 throw new ArgumentException("Аудиоданные не могут быть пустыми", nameof(audioData));
             }
 
+            // Для обеспечения асинхронного выполнения метода
+            await Task.Yield();
+
             // Проверяем, является ли входящий массив данных WAV-файлом
             if (IsWavFormat(audioData))
             {
-                // Если данные уже в WAV-формате, проверяем требуется ли ресемплирование
-                using (var stream = new MemoryStream(audioData))
-                using (var reader = new WaveFileReader(stream))
+                try
                 {
-                    // Whisper требует 16кГц моно
-                    if (reader.WaveFormat.SampleRate == DEFAULT_SAMPLE_RATE &&
-                        reader.WaveFormat.Channels == DEFAULT_CHANNELS)
+                    // Если данные уже в WAV-формате, проверяем требуется ли ресемплирование
+                    using (var stream = new MemoryStream(audioData))
+                    using (var reader = new WaveFileReader(stream))
                     {
-                        // Если формат уже соответствует требованиям, просто возвращаем данные
-                        return audioData;
+                        // Whisper требует 16кГц моно
+                        if (reader.WaveFormat.SampleRate == DEFAULT_SAMPLE_RATE &&
+                            reader.WaveFormat.Channels == DEFAULT_CHANNELS)
+                        {
+                            // Если формат уже соответствует требованиям, просто возвращаем данные
+                            return audioData;
+                        }
+                        else
+                        {
+                            // Конвертируем формат
+                            return ConvertWavFormat(audioData, DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS);
+                        }
                     }
-                    else
-                    {
-                        // Конвертируем формат
-                        return ConvertWavFormat(audioData, DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS);
-                    }
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidOperationException("Ошибка при обработке WAV-аудио. Возможно, файл поврежден или имеет неподдерживаемый формат", ex);
                 }
             }
             else
             {
-                // Если это не WAV, предполагаем что это PCM-данные и добавляем к ним WAV-заголовок
-                return AddWavHeader(audioData);
+                // В соответствии с техническим заданием, система должна поддерживать только WAV формат
+                // Если данные не являются WAV, но похожи на PCM, можно попытаться добавить заголовок
+                if (audioData.Length > 1000) // Простая эвристика для проверки на PCM-данные
+                {
+                    try 
+                    {
+                        _logger.LogWarning("Аудиоданные не в формате WAV. Пытаемся обработать как PCM-данные");
+                        return AddWavHeader(audioData);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new InvalidOperationException("Аудиоданные не в формате WAV и не могут быть преобразованы в WAV", ex);
+                    }
+                }
+                else
+                {
+                    throw new InvalidOperationException("Аудиоданные должны быть в формате WAV в соответствии с техническим заданием");
+                }
             }
         }
 
