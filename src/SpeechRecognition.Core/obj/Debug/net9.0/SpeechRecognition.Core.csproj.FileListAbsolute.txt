@@ -21,3 +21,4 @@ C:\Users\user\Desktop\проекты\speechRecognition\src\SpeechRecognition.Cor
 C:\Users\user\Desktop\проекты\speechRecognition\src\SpeechRecognition.Core\obj\Debug\net9.0\refint\SpeechRecognition.Core.dll
 C:\Users\user\Desktop\проекты\speechRecognition\src\SpeechRecognition.Core\obj\Debug\net9.0\SpeechRecognition.Core.pdb
 C:\Users\user\Desktop\проекты\speechRecognition\src\SpeechRecognition.Core\obj\Debug\net9.0\ref\SpeechRecognition.Core.dll
+C:\Users\user\Desktop\проекты\speechRecognition\src\SpeechRecognition.Core\obj\Debug\net9.0\SpeechRecognition.Core.sourcelink.json

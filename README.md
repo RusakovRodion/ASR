@@ -188,7 +188,7 @@ SpeechRecognition - это программный комплекс для авт
 
 ### Системные требования
 
-- **.NET 7.0** или выше
+- **.NET 9.0**
 - Windows, Linux или macOS
 - Минимум 4 ГБ оперативной памяти (рекомендуется 8 ГБ+)
 - Для использования GPU-ускорения требуется совместимая видеокарта с поддержкой CUDA
@@ -197,44 +197,51 @@ SpeechRecognition - это программный комплекс для авт
 
 1. Клонируйте репозиторий:
    ```
-   git clone https://github.com/your-username/speechRecognition.git
+   git clone https://github.com/RusakovRodion/ASR.git
    ```
 
 2. Перейдите в директорию проекта:
    ```
-   cd speechRecognition
+   cd ASR
    ```
 
 3. Соберите проект:
    ```
-   dotnet build
+   dotnet build src/SpeechRecognition.sln
    ```
 
-### Настройка
+4. Проверьте, что в директории `models/` находятся модели для распознавания:
+   - `ggml-tiny.bin` (меньше и быстрее, но менее точная)
+   - `ggml-base.bin` (более точная, но требует больше ресурсов)
 
-1. Скачайте модель Whisper (tiny или base) и поместите в директорию `models/`
-2. Для использования консольного приложения:
-   ```
-   dotnet run --project src/SpeechRecognition.Console
-   ```
+   Если моделей нет, их можно скачать с официального репозитория Whisper или использовать предустановленные модели.
 
-## Использование
+### Запуск консольного приложения
 
-### Консольное приложение
+Есть несколько способов запустить консольное приложение:
 
-Консольное приложение позволяет быстро протестировать функциональность распознавания речи:
+#### Способ 1: Использование dotnet run
 
 ```
-whisper-stream --file <путь_к_файлу> [--language ru] [--model <путь_к_модели>] [--num-chunks 1]
+dotnet run --project src/SpeechRecognition.Console/SpeechRecognition.Console.csproj -- --file audioExamples/test.wav --language ru
 ```
 
-Параметры:
+#### Способ 2: Использование готового исполняемого файла
+
+В репозитории уже есть собранное приложение в директории `publish-self-contained`. Вы можете запустить его напрямую:
+
+```
+publish-self-contained/whisper-stream.exe --file audioExamples/test.wav --language ru
+```
+
+#### Параметры командной строки:
+
 - `--file` или `-f`: Путь к аудиофайлу для распознавания
 - `--language` или `-l`: Язык для распознавания (по умолчанию: ru)
-- `--model` или `-m`: Путь к файлу модели Whisper
-- `--num-chunks` или `-n`: Количество фрагментов для обработки
+- `--model` или `-m`: Путь к файлу модели Whisper (по умолчанию: models/ggml-base.bin)
+- `--num-chunks` или `-n`: Количество фрагментов для обработки (по умолчанию: 1)
 
-Примеры использования:
+#### Примеры использования:
 
 ```bash
 # Базовое распознавание русской речи из файла test.wav
@@ -243,54 +250,190 @@ whisper-stream --file audioExamples/test.wav --language ru
 # Распознавание с разбиением на 3 фрагмента
 whisper-stream --file audioExamples/test.wav --language ru --num-chunks 3
 
-# Использование конкретной модели и языка
-whisper-stream --file audioExamples/test.wav --language ru --model models/ggml-base.bin --num-chunks 3
+# Использование конкретной модели tiny
+whisper-stream --file audioExamples/test.wav --language ru --model models/ggml-tiny.bin
 ```
+
+### Запуск тестов
+
+Для запуска тестов используйте следующую команду:
+
+```
+dotnet test SpeechRecognition.Tests/SpeechRecognition.Tests.csproj
+```
+
+Для запуска тестов с измерением покрытия кода:
+
+```
+dotnet test SpeechRecognition.Tests/SpeechRecognition.Tests.csproj /p:CollectCoverage=true /p:CoverletOutputFormat=opencover
+```
+
+Для запуска определенной категории тестов:
+
+```
+dotnet test SpeechRecognition.Tests/SpeechRecognition.Tests.csproj --filter "Category=Integration"
+```
+
+## Использование
 
 ### Интеграция в приложения
 
-Для интеграции в существующие приложения используйте `ISpeechRecognitionService`:
+Для интеграции в существующие приложения используйте библиотеку SpeechRecognition.Core:
+
+1. Добавьте ссылку на проект или создайте NuGet-пакет из проекта SpeechRecognition.Core:
+   
+   ```
+   dotnet add reference <путь_к_проекту>/src/SpeechRecognition.Core/SpeechRecognition.Core.csproj
+   ```
+
+2. Пример кода для интеграции:
 
 ```csharp
 using Microsoft.Extensions.Logging;
 using SpeechRecognition.Core;
 
-// Создание сервиса распознавания
+// Создание логгера
+using var loggerFactory = LoggerFactory.Create(builder =>
+{
+    builder.AddConsole();
+    builder.SetMinimumLevel(LogLevel.Information);
+});
 var logger = loggerFactory.CreateLogger<Program>();
-var service = SpeechRecognitionServiceFactory.CreateService(
+
+// Создание и инициализация сервиса распознавания
+using var service = SpeechRecognitionServiceFactory.CreateService(
     logger, 
-    "path/to/model.bin", 
-    "ru", 
-    "tiny"
+    "models/ggml-tiny.bin", // Путь к модели
+    "ru",                   // Язык распознавания
+    "tiny"                  // Тип модели
 );
 
-// Инициализация сервиса
+// Инициализация сервиса (загрузка модели)
 await service.InitializeAsync();
 
-// Подписка на события
+// Подписка на события распознавания
+service.RecognitionStarted += (sender, e) => {
+    Console.WriteLine($"Начало распознавания фрагмента #{e.Result.FragmentId}");
+};
+
 service.RecognitionCompleted += (sender, e) => {
-    Console.WriteLine($"Распознано: {e.Result.Text}");
+    Console.WriteLine($"Распознавание завершено: {e.Result.Text}");
 };
 
 // Обработка аудиофайла
 string result = await service.ProcessFileAsync("path/to/audio.wav");
+Console.WriteLine($"Результат распознавания: {result}");
 
-// Обработка аудиофрагмента
+// Обработка аудиофрагмента из потока байтов
 byte[] audioChunk = GetAudioChunk(); // получение аудиоданных
 string fragmentResult = await service.ProcessStreamAsync(audioChunk);
+Console.WriteLine($"Результат фрагмента: {fragmentResult}");
 
-// Использование очереди распознавания
+// Пример работы с очередью фрагментов
 var (queueItemId, resultTask) = await service.EnqueueRecognitionItemAsync(
     audioChunk, 
-    priority: 0, 
+    priority: 0, // Меньшее значение = выше приоритет
     metadata: "fragment1"
 );
 
-// Позже получение результата
-string text = await resultTask;
-
 // Запуск обработки очереди с параллелизмом
 await service.ProcessQueueAsync(maxParallelProcessing: 2);
+
+// Получение результата
+string text = await resultTask;
+Console.WriteLine($"Результат из очереди: {text}");
+```
+
+### Полный пример интеграции
+
+Пример приложения, использующего систему распознавания речи:
+
+```csharp
+using System;
+using System.IO;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using SpeechRecognition.Core;
+
+namespace SpeechRecognitionDemo
+{
+    class Program
+    {
+        static async Task Main(string[] args)
+        {
+            // Настройка логгера
+            using var loggerFactory = LoggerFactory.Create(builder =>
+            {
+                builder.AddConsole();
+                builder.SetMinimumLevel(LogLevel.Information);
+            });
+            var logger = loggerFactory.CreateLogger<Program>();
+            
+            // Путь к модели и аудиофайлам
+            string modelPath = "models/ggml-tiny.bin";
+            string audioPath = "audio/example.wav";
+            
+            // Проверяем наличие файлов
+            if (!File.Exists(modelPath))
+            {
+                Console.WriteLine($"Модель не найдена: {modelPath}");
+                return;
+            }
+            
+            if (!File.Exists(audioPath))
+            {
+                Console.WriteLine($"Аудиофайл не найден: {audioPath}");
+                return;
+            }
+            
+            try
+            {
+                // Создание и инициализация сервиса распознавания
+                using var service = SpeechRecognitionServiceFactory.CreateService(
+                    logger, modelPath, "ru", "tiny");
+                
+                // Подписка на события
+                service.RecognitionStarted += (sender, e) => {
+                    Console.WriteLine($"Начало распознавания фрагмента #{e.Result.FragmentId}");
+                };
+                
+                service.RecognitionCompleted += (sender, e) => {
+                    Console.WriteLine($"Распознавание завершено: {e.Result.Text}");
+                    Console.WriteLine($"Длительность: {(e.Result.EndTime - e.Result.StartTime).TotalSeconds:F2} секунд");
+                };
+                
+                service.QueueItemStatusChanged += (sender, e) => {
+                    Console.WriteLine($"Статус фрагмента {e.Metadata}: {e.OldStatus} -> {e.NewStatus}");
+                };
+                
+                // Инициализация сервиса
+                Console.WriteLine("Инициализация модели...");
+                await service.InitializeAsync();
+                Console.WriteLine("Модель инициализирована успешно");
+                
+                // Распознавание целого файла
+                Console.WriteLine($"Распознавание файла: {audioPath}");
+                string result = await service.ProcessFileAsync(audioPath);
+                Console.WriteLine($"Результат распознавания:\n{result}");
+                
+                // Распознавание файла по частям
+                Console.WriteLine("\nРаспознавание файла по частям (3 фрагмента):");
+                string chunkResult = await service.ProcessFileInChunksAsync(audioPath, numChunks: 3);
+                Console.WriteLine($"Результат распознавания по частям:\n{chunkResult}");
+                
+                Console.WriteLine("\nПример завершен успешно");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка: {ex.Message}");
+                if (ex.InnerException != null)
+                {
+                    Console.WriteLine($"Внутреннее исключение: {ex.InnerException.Message}");
+                }
+            }
+        }
+    }
+}
 ```
 
 ### Примеры использования
