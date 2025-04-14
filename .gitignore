@@ -6,6 +6,7 @@ out/
 # Visual Studio files
 .vs/
 .vscode/
+.cursor/
 *.suo
 *.user
 *.userosscache
