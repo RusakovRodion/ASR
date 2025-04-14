@@ -5,6 +5,9 @@
     <TargetFramework>net9.0</TargetFramework>
     <Nullable>annotations</Nullable>
     <AssemblyName>whisper-stream</AssemblyName>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
   </PropertyGroup>
 
   <ItemGroup>

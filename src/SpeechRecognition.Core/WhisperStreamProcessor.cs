@@ -207,37 +207,60 @@ namespace SpeechRecognition.Core
                 // Проверяем, что аудио в WAV формате
                 if (!_audioProcessor.IsWavFile(audioChunk))
                 {
-                    _logger.LogWarning("Аудиоданные не в формате WAV");
-                    var ex = new InvalidOperationException("Аудиоданные должны быть в формате WAV");
-                    RecognitionError?.Invoke(this, new Events.RecognitionErrorEventArgs(ex, "Неверный формат аудио"));
-                    throw ex;
+                    _logger.LogWarning($"Аудиоданные не в формате WAV или файл поврежден (размер: {audioChunk.Length} байт)");
+                    
+                    // Попытка восстановить данные, если они похожи на PCM
+                    try
+                    {
+                        _logger.LogInformation("Попытка преобразования данных в WAV формат");
+                        audioChunk = await _audioProcessor.PrepareAudioDataAsync(audioChunk);
+                        _logger.LogInformation($"Преобразование завершено, новый размер: {audioChunk.Length} байт");
+                    }
+                    catch (Exception convEx)
+                    {
+                        _logger.LogError(convEx, "Не удалось преобразовать аудиоданные в формат WAV");
+                        var ex = new InvalidOperationException("Аудиоданные должны быть в формате WAV", convEx);
+                        RecognitionError?.Invoke(this, new Events.RecognitionErrorEventArgs(ex, "Неверный формат аудио"));
+                        throw ex;
+                    }
                 }
-
-                _logger.LogDebug($"Обработка аудиофрагмента размером {audioChunk.Length} байт");
-                var result = await _sessionManager.ProcessFragmentAsync(_currentSession.Id, audioChunk, cancellationToken);
                 
+                // Создаем событие о начале распознавания
+                var startEventArgs = new RecognitionEventArgs(string.Empty, audioChunk.Length);
+                RecognitionStarted?.Invoke(this, startEventArgs);
+
+                // Добавляем фрагмент в сессию
+                int fragmentId = await _currentSession.AddFragmentAsync(audioChunk);
+                
+                // Обрабатываем фрагмент
+                _logger.LogDebug($"Начало обработки фрагмента {fragmentId}");
+                var result = await _currentSession.ProcessFragmentAsync(fragmentId, cancellationToken);
+                _logger.LogDebug($"Фрагмент {fragmentId} успешно обработан");
+                
+                // Вызываем событие успешного распознавания
                 if (result != null)
                 {
-                    _logger.LogDebug($"Распознан текст: {result.Text}");
+                    var completedEventArgs = new RecognitionEventArgs(result.Text, audioChunk.Length);
+                    RecognitionCompleted?.Invoke(this, completedEventArgs);
                     return result.Text;
                 }
                 else
                 {
-                    _logger.LogWarning("Не удалось получить результат распознавания");
+                    _logger.LogWarning($"Фрагмент {fragmentId} был обработан, но результат равен null");
                     var ex = new InvalidOperationException("Не удалось получить результат распознавания");
                     RecognitionError?.Invoke(this, new Events.RecognitionErrorEventArgs(ex, "Пустой результат распознавания"));
                     throw ex;
                 }
             }
-            catch (OperationCanceledException ex)
+            catch (OperationCanceledException)
             {
                 _logger.LogInformation("Операция распознавания была отменена");
                 throw;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Ошибка при распознавании аудиофрагмента");
-                RecognitionError?.Invoke(this, new Events.RecognitionErrorEventArgs(ex, "Ошибка при распознавании аудиофрагмента"));
+                _logger.LogError(ex, "Ошибка при обработке потокового аудио");
+                RecognitionError?.Invoke(this, new Events.RecognitionErrorEventArgs(ex, "Ошибка распознавания"));
                 throw;
             }
         }
@@ -371,7 +394,7 @@ namespace SpeechRecognition.Core
                             }
                             
                             // Очищаем текст от шума
-                            string cleanedText = CleanupMusic(result.Text);
+                            string cleanedText = result != null ? CleanupMusic(result.Text) : string.Empty;
                             
                             // Форматируем результат с текущим временем
                             string fragmentOutput = $"[{DateTime.Now:HH:mm:ss.fff}] === Фрагмент {fragmentIndex + 1} ===\n{cleanedText}\n";

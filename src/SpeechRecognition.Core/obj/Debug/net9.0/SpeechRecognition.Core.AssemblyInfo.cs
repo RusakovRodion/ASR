@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("SpeechRecognition.Core")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+feb118154f79b15704769603d828f53f6cd55532")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+9ef343afaea9238ef800570f7be5370b7a04967f")]
 [assembly: System.Reflection.AssemblyProductAttribute("SpeechRecognition.Core")]
 [assembly: System.Reflection.AssemblyTitleAttribute("SpeechRecognition.Core")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

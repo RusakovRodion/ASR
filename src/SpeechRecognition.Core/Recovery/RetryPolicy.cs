@@ -34,6 +34,11 @@ namespace SpeechRecognition.Core.Recovery
             typeof(InvalidOperationException),
             typeof(Exception)
         };
+
+        /// <summary>
+        /// Типы исключений, которые не следует обрабатывать повторными попытками
+        /// </summary>
+        public Type[] NonRetryableExceptions { get; set; } = Array.Empty<Type>();
     }
 
     /// <summary>
@@ -96,6 +101,16 @@ namespace SpeechRecognition.Core.Recovery
                     lastException = ex;
                     attemptCount++;
 
+                    // Проверяем, нельзя ли повторить после этого исключения
+                    foreach (var exceptionType in _options.NonRetryableExceptions)
+                    {
+                        if (exceptionType.IsInstanceOfType(ex))
+                        {
+                            _logger.LogError(ex, $"Операция {operationName} не может быть повторена из-за исключения {exceptionType.Name}");
+                            throw;
+                        }
+                    }
+
                     // Проверяем, можно ли повторить после этого исключения
                     bool canRetry = false;
                     foreach (var exceptionType in _options.RetryableExceptions)
@@ -123,14 +138,14 @@ namespace SpeechRecognition.Core.Recovery
                     }
                     catch (OperationCanceledException)
                     {
-                        // Задержка отменена, выходим из цикла
                         throw;
                     }
                 }
             }
 
-            // Этот код никогда не должен выполняться, т.к. в цикле мы либо возвращаем результат, либо выбрасываем исключение
-            throw new InvalidOperationException($"Операция {operationName} не может быть выполнена", lastException);
+            // Этот код не должен быть достигнут, если количество попыток исчерпано,
+            // исключение должно быть выброшено раньше
+            throw new InvalidOperationException($"Исчерпаны все попытки выполнения операции '{operationName}'", lastException);
         }
 
         /// <summary>
@@ -139,19 +154,17 @@ namespace SpeechRecognition.Core.Recovery
         /// <param name="operation">Асинхронная операция</param>
         /// <param name="operationName">Имя операции (для логирования)</param>
         /// <param name="cancellationToken">Токен отмены</param>
+        /// <returns>Task, представляющий асинхронную операцию</returns>
         public async Task ExecuteAsync(
             Func<CancellationToken, Task> operation,
             string operationName,
             CancellationToken cancellationToken = default)
         {
-            await ExecuteAsync<object>(
-                async (token) => 
-                {
-                    await operation(token);
-                    return null;
-                }, 
-                operationName, 
-                cancellationToken);
+            await ExecuteAsync<object>(async (token) =>
+            {
+                await operation(token);
+                return null;
+            }, operationName, cancellationToken);
         }
     }
 } 

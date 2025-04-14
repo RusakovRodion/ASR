@@ -134,16 +134,60 @@ namespace SpeechRecognition.Core.Audio
         /// <returns>true, если данные имеют заголовок WAV-файла</returns>
         public bool IsWavFormat(byte[] data)
         {
-            if (data.Length < 12)
+            if (data.Length < 44)  // Минимальный размер WAV-заголовка 44 байта
             {
                 return false;
             }
 
-            // Проверяем RIFF заголовок
-            string riffHeader = Encoding.ASCII.GetString(data, 0, 4);
-            string waveHeader = Encoding.ASCII.GetString(data, 8, 4);
+            try 
+            {
+                // Проверяем RIFF заголовок
+                string riffHeader = Encoding.ASCII.GetString(data, 0, 4);
+                string waveHeader = Encoding.ASCII.GetString(data, 8, 4);
 
-            return riffHeader == "RIFF" && waveHeader == "WAVE";
+                // Базовая проверка
+                if (riffHeader != "RIFF" || waveHeader != "WAVE")
+                {
+                    return false;
+                }
+
+                // Дополнительная проверка структуры WAV-файла
+                // Ищем fmt и data секции
+                bool hasFmtChunk = false;
+                bool hasDataChunk = false;
+
+                int pos = 12; // После RIFF и WAVE
+                while (pos < data.Length - 8)
+                {
+                    string chunkId = Encoding.ASCII.GetString(data, pos, 4);
+                    int chunkSize = BitConverter.ToInt32(data, pos + 4);
+
+                    if (chunkId == "fmt ")
+                    {
+                        hasFmtChunk = true;
+                    }
+                    else if (chunkId == "data")
+                    {
+                        hasDataChunk = true;
+                    }
+
+                    pos += 8 + chunkSize;
+                    if (pos % 2 != 0) pos++; // выравнивание
+                    
+                    // Если нашли обе необходимые секции, можно выходить
+                    if (hasFmtChunk && hasDataChunk) 
+                    {
+                        break;
+                    }
+                }
+
+                return hasFmtChunk && hasDataChunk;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Ошибка при проверке WAV-формата");
+                return false;
+            }
         }
 
         /// <summary>
@@ -309,103 +353,155 @@ namespace SpeechRecognition.Core.Audio
                 throw new ArgumentException("Количество фрагментов должно быть положительным числом", nameof(numChunks));
             }
 
-            // Чтение файла
-            byte[] fileData = await File.ReadAllBytesAsync(filePath);
-            
-            // Проверяем, что это WAV файл
-            if (!IsWavFile(fileData))
+            // Если запрошен 1 фрагмент, просто возвращаем весь файл
+            if (numChunks == 1)
             {
-                throw new InvalidOperationException("Файл должен быть в формате WAV");
-            }
-            
-            WaveFormat waveFormat;
-            using (var stream = new MemoryStream(fileData))
-            using (var reader = new WaveFileReader(stream))
-            {
-                waveFormat = reader.WaveFormat;
-            }
-            
-            // Минимальный размер чанка - 30 секунд аудио
-            int bytesPerSample = waveFormat.BitsPerSample / 8;
-            int minChunkSize = 30 * waveFormat.SampleRate * bytesPerSample * waveFormat.Channels;
-            
-            // Если аудиофайл слишком маленький, возвращаем его целиком
-            if (fileData.Length < minChunkSize + 44) // 44 - размер WAV-заголовка
-            {
+                byte[] fileData = await File.ReadAllBytesAsync(filePath);
+                if (!IsWavFile(fileData))
+                {
+                    throw new InvalidOperationException("Файл должен быть в формате WAV");
+                }
                 return new List<byte[]> { fileData };
             }
-            
-            // Анализируем аудио для обнаружения пауз и разбиения на смысловые фрагменты
-            List<int> splitPositions = FindSplitPositions(filePath, numChunks);
-            
-            // Если не удалось найти подходящие позиции для разбиения (или их меньше 2),
-            // используем стандартный алгоритм разбиения на равные части
-            if (splitPositions.Count < 2)
+
+            try
             {
-                // Извлекаем PCM данные из WAV файла
-                byte[] pcmData = ExtractPcmFromWav(fileData);
+                // Чтение файла целиком для проверки формата
+                byte[] fileData = await File.ReadAllBytesAsync(filePath);
                 
-                // Рассчитываем размер чанка при заданном количестве
-                int estimatedChunkSize = pcmData.Length / numChunks;
-                
-                // Проверяем, не получится ли чанк меньше 30 секунд
-                if (estimatedChunkSize < minChunkSize && pcmData.Length > minChunkSize)
+                // Проверяем, что это WAV файл
+                if (!IsWavFile(fileData))
                 {
-                    // Рассчитываем максимально возможное количество чанков
-                    int maxAllowedChunks = Math.Max(1, pcmData.Length / minChunkSize);
-                    numChunks = maxAllowedChunks;
+                    throw new InvalidOperationException("Файл должен быть в формате WAV");
                 }
                 
-                // Если аудиофайл не может быть разбит даже на 2 части, возвращаем его целиком
-                if (numChunks <= 1)
+                // Читаем весь файл через NAudio для корректного разбиения
+                using (var audioFile = new AudioFileReader(filePath))
                 {
-                    return new List<byte[]> { fileData };
-                }
-                
-                // Делаем размер фрагмента кратным frameSize
-                int frameSize = waveFormat.BlockAlign;
-                int chunkSize = pcmData.Length / numChunks;
-                chunkSize = (chunkSize / frameSize) * frameSize;
-                
-                List<byte[]> pcmChunks = new List<byte[]>();
-                
-                // Разбиваем PCM-данные на равные фрагменты
-                for (int i = 0; i < numChunks; i++)
-                {
-                    int startIndex = i * chunkSize;
-                    int length = chunkSize;
+                    WaveFormat waveFormat = audioFile.WaveFormat;
                     
-                    if (i == numChunks - 1)
+                    // Определяем минимальный размер фрагмента (10 секунд аудио)
+                    int bytesPerSample = waveFormat.BitsPerSample / 8;
+                    int minChunkDuration = 10; // в секундах
+                    int minChunkSize = minChunkDuration * waveFormat.SampleRate * bytesPerSample * waveFormat.Channels;
+                    
+                    // Если аудиофайл слишком маленький, возвращаем его целиком
+                    if (audioFile.Length < minChunkSize + 44) // 44 - размер WAV-заголовка
                     {
-                        length = pcmData.Length - startIndex;
-                        length = (length / frameSize) * frameSize;
+                        return new List<byte[]> { fileData };
                     }
                     
-                    if (startIndex < 0) startIndex = 0;
-                    if (startIndex + length > pcmData.Length) length = (pcmData.Length - startIndex) / frameSize * frameSize;
+                    // Анализируем аудио для обнаружения пауз и разбиения на смысловые фрагменты
+                    List<int> splitPositions = FindSplitPositions(filePath, numChunks);
                     
-                    if (length <= 0) continue;
+                    // Если удалось найти точки разбиения, используем их
+                    if (splitPositions.Count >= 2)
+                    {
+                        var chunks = SplitAudioAtPositions(filePath, splitPositions);
+                        
+                        // Дополнительная проверка каждого фрагмента
+                        var validChunks = new List<byte[]>();
+                        foreach (var chunk in chunks)
+                        {
+                            if (IsWavFile(chunk))
+                            {
+                                // Проверяем формат на соответствие требованиям Whisper
+                                try 
+                                {
+                                    using (var stream = new MemoryStream(chunk))
+                                    using (var reader = new WaveFileReader(stream))
+                                    {
+                                        // Whisper требует 16кГц моно
+                                        if (reader.WaveFormat.SampleRate != DEFAULT_SAMPLE_RATE || 
+                                            reader.WaveFormat.Channels != DEFAULT_CHANNELS)
+                                        {
+                                            // Конвертируем в нужный формат
+                                            var processedChunk = ConvertWavFormat(chunk, DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS);
+                                            validChunks.Add(processedChunk);
+                                        }
+                                        else
+                                        {
+                                            validChunks.Add(chunk);
+                                        }
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex, "Фрагмент не может быть прочитан как WAV-файл, пропускаем");
+                                }
+                            }
+                        }
+                        
+                        if (validChunks.Count > 0)
+                        {
+                            return validChunks;
+                        }
+                    }
                     
-                    byte[] chunk = new byte[length];
-                    Array.Copy(pcmData, startIndex, chunk, 0, length);
+                    // Если не нашли подходящие позиции или не получили валидные фрагменты,
+                    // делаем простое равномерное разбиение
+                    _logger.LogInformation("Используем равномерное разбиение файла на {0} фрагментов", numChunks);
                     
-                    pcmChunks.Add(chunk);
+                    long totalSamples = audioFile.Length / audioFile.WaveFormat.BlockAlign;
+                    int samplesPerChunk = (int)(totalSamples / numChunks);
+                    int frameSize = audioFile.WaveFormat.BlockAlign;
+                    
+                    // Убеждаемся, что фрагмент будет кратен размеру фрейма
+                    samplesPerChunk = (samplesPerChunk / frameSize) * frameSize;
+                    
+                    List<byte[]> wavChunks = new List<byte[]>();
+                    
+                    // Сбрасываем позицию на начало
+                    audioFile.Position = 0;
+                    
+                    for (int i = 0; i < numChunks; i++)
+                    {
+                        int startSample = i * samplesPerChunk;
+                        int endSample = (i == numChunks - 1) ? (int)totalSamples : (i + 1) * samplesPerChunk;
+                        int chunkSamples = endSample - startSample;
+                        
+                        if (chunkSamples <= 0) continue;
+                        
+                        // Создаем буфер для чанка
+                        float[] sampleBuffer = new float[chunkSamples * waveFormat.Channels];
+                        
+                        // Позиционируем считыватель на начало фрагмента
+                        audioFile.Position = startSample * frameSize;
+                        
+                        // Читаем данные фрагмента
+                        int samplesRead = audioFile.Read(sampleBuffer, 0, sampleBuffer.Length);
+                        
+                        if (samplesRead > 0)
+                        {
+                            // Создаем WAV-файл с правильными заголовками
+                            using (var memStream = new MemoryStream())
+                            {
+                                using (var writer = new WaveFileWriter(memStream, new WaveFormat(DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS)))
+                                {
+                                    writer.WriteSamples(sampleBuffer, 0, samplesRead);
+                                }
+                                
+                                byte[] wavChunk = memStream.ToArray();
+                                if (IsWavFile(wavChunk))
+                                {
+                                    wavChunks.Add(wavChunk);
+                                }
+                                else
+                                {
+                                    _logger.LogWarning("Созданный фрагмент не является валидным WAV-файлом, пропускаем");
+                                }
+                            }
+                        }
+                    }
+                    
+                    return wavChunks;
                 }
-                
-                // Создаем WAV-фрагменты
-                List<byte[]> wavChunks = new List<byte[]>();
-                foreach (var pcmChunk in pcmChunks)
-                {
-                    byte[] wavChunk = AddWavHeader(pcmChunk, waveFormat.SampleRate, waveFormat.BitsPerSample, waveFormat.Channels);
-                    wavChunks.Add(wavChunk);
-                }
-                
-                return wavChunks;
             }
-            else
+            catch (Exception ex)
             {
-                // Разбиваем по обнаруженным паузам
-                return SplitAudioAtPositions(filePath, splitPositions);
+                _logger.LogError(ex, "Ошибка при разбиении аудиофайла на фрагменты");
+                // В случае ошибки возвращаем файл целиком
+                return new List<byte[]> { await File.ReadAllBytesAsync(filePath) };
             }
         }
         

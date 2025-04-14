@@ -35,6 +35,10 @@ namespace SpeechRecognition.Core.Recovery
                     typeof(TimeoutException),
                     typeof(InvalidOperationException),
                     typeof(Exception)
+                },
+                NonRetryableExceptions = new Type[]
+                {
+                    typeof(Whisper.net.Wave.CorruptedWaveException)
                 }
             };
 
