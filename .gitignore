@@ -93,9 +93,5 @@ models/*.ggml
 *.userosscache
 *.sln.docstates
 
-# Audio sample files (могут быть большими)
-audioExamples/*.wav
-audioExamples/*.mp3
-audioExamples/*.flac
 # Сохраняем тестовый файл для демонстрации
 !audioExamples/test.wav 
